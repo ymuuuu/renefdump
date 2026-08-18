@@ -83,9 +83,11 @@ the manual route.
 | `OUT_DIR` | `/data/local/tmp/renefdump` | Output directory (manual route; the wrapper overrides it per run) |
 | `PERMS_FILTER` | `"rw"` | `"rw"` = writable ranges only (fridump default), `"r"` = every readable range |
 | `SKIP_FILE_BACKED` | `false` | `true` limits the dump to anon/heap/stack |
-| `MAX_TOTAL_MB` | `1024` | Abort if the selection is larger |
+| `SKIP_EMPTY` | `true` | Skip ranges with `Rss: 0` — never-touched reservations that can only read as zeros |
+| `MAX_TOTAL_MB` | `4096` | Abort if the selection is larger |
 | `SPLIT_MB` | `256` | Split a single range above this into `.partN` files |
 | `CHUNK_KB` | `1024` | Read granularity |
+| `HEARTBEAT_MB` | `32` | Emit a progress line every this many MB while dumping a range |
 | `VERBOSE` | `false` | Log every range |
 
 ## Output
@@ -96,8 +98,23 @@ copy of `/proc/self/maps`. A range above `SPLIT_MB` becomes `.part0`, `.part1`, 
 are zero-filled, so offsets in the dump always match addresses in the maps — a gap shows up
 as a run of zero bytes, not as missing data.
 
+When the run completes, the script writes a `DONE` file containing
+`<ranges> <bytes_written> <bytes_zero_filled>`; the wrapper waits for that sentinel before
+pulling, because the client returning does not mean the dump finished.
+
 Unlike fridump3, the filename identifies the mapping a hit came from, and there are no
 routine split boundaries cutting a string in half.
+
+## Why the dump is smaller than the map total
+
+The filter counts *mapped* bytes, not *resident* ones. On a real app, `rw-` ranges total
+3359 MB mapped but only 205 MB (6.1%) is actually resident: 448 ranges totalling 1344 MB
+have `Rss: 0` — address space ART reserved and never touched, physically unbacked, and only
+readable as zeros (the worst offenders are two 1024 MB `[anon:dalvik-LinearAlloc]`
+reservations). Dumping them is pure waste, so the script reads `/proc/self/smaps` and skips
+zero-resident ranges (`SKIP_EMPTY`); the run reports them, e.g.
+`[*] skipped 448 non-resident ranges (1344.4 MB of untouched reservations)`. If smaps is
+unreadable, the script falls back to plain maps and keeps everything.
 
 Run `strings` on the host after pulling — it is faster and better than anything the agent
 could do on the device:

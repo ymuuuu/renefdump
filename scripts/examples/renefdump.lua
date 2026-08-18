@@ -15,14 +15,17 @@ M.config = {
   OUT_DIR          = "/data/local/tmp/renefdump", -- output directory (default; the wrapper overrides it per run via RENEFDUMP_OUT_DIR)
   PERMS_FILTER     = "rw",              -- "rw" = writable only (fridump default), "r" = any readable
   SKIP_FILE_BACKED = false,             -- true = anon/heap/stack only, skips mapped .so/.dex/.apk
-  MAX_TOTAL_MB     = 1024,              -- abort if the selection exceeds this
+  SKIP_EMPTY       = true,              -- true = skip ranges with Rss: 0 (untouched ART reservations)
+  MAX_TOTAL_MB     = 4096,              -- abort if the selection exceeds this
   SPLIT_MB         = 256,               -- split a single range above this into .partN files
   CHUNK_KB         = 1024,              -- read granularity, bounds peak Lua memory
+  HEARTBEAT_MB     = 32,                -- emit a progress line every this many MB during a range
   VERBOSE          = false,             -- per-range logging
 }
 
-M.MAPS_PATH = "/proc/self/maps"
-M.MEM_PATH  = "/proc/self/mem"
+M.MAPS_PATH  = "/proc/self/maps"
+M.SMAPS_PATH = "/proc/self/smaps"
+M.MEM_PATH   = "/proc/self/mem"
 
 -- Color globals exist inside the renef agent but not on a bare host interpreter.
 local CYAN   = _G.CYAN or "\27[36m"
@@ -72,6 +75,38 @@ function M.parse_maps(text)
   return ranges
 end
 
+-- Parse a full smaps file into an array of range records. Each record is a
+-- maps record plus `rss` (resident bytes). A header is any line that parses
+-- as a maps line; indented `Rss: <n> kB` lines between headers set rss. A
+-- header with no Rss line before the next header gets rss = 0. VmFlags and
+-- every other key are ignored (only Rss matters).
+function M.parse_smaps(text)
+  local ranges = {}
+  if type(text) ~= "string" then return ranges end
+
+  local current, rss_kb
+  local function flush()
+    if current then
+      current.rss = (rss_kb or 0) * 1024
+      ranges[#ranges + 1] = current
+    end
+    current, rss_kb = nil, nil
+  end
+
+  for line in text:gmatch("[^\n]+") do
+    local r = M.parse_maps_line(line)
+    if r then
+      flush()
+      current = r
+    elseif current then
+      local rss = line:match("^%s*Rss:%s*(%d+)%s*kB")
+      if rss then rss_kb = tonumber(rss) end
+    end
+  end
+  flush()
+  return ranges
+end
+
 -- Ranges that are never safe or never useful to dump, whatever the config.
 local function always_skip(path)
   if path:sub(1, 5) == "/dev/" then return true end  -- device memory: read can block
@@ -88,6 +123,10 @@ function M.should_dump(r, cfg)
 
   if r.perms:sub(1, 1) ~= "r" then return false end
   if cfg.PERMS_FILTER == "rw" and r.perms:sub(2, 2) ~= "w" then return false end
+
+  -- rss == 0 means a never-touched reservation: it can only read as zeros.
+  -- rss == nil (residency unknown, e.g. plain maps fallback) is NOT skipped.
+  if cfg.SKIP_EMPTY and r.rss == 0 then return false end
 
   local path = r.path or ""
   if always_skip(path) then return false end
@@ -193,6 +232,12 @@ function M.resolve_out_dir(cfg)
   return cfg.OUT_DIR
 end
 
+-- Heartbeat output hook; tests replace it with a collector. Used only for
+-- the mid-range progress lines so the renef client keeps relaying output.
+function M.log(msg)
+  print(msg)
+end
+
 -- Copy one range from `mem` (an open /proc/<pid>/mem style handle) to disk.
 --
 -- The handle is re-seeked before every chunk: a failed read on /proc/*/mem
@@ -208,7 +253,10 @@ function M.dump_range(mem, r, out_dir, cfg)
 
   local split_bytes = (cfg.SPLIT_MB or 256) * 1024 * 1024
   local chunk = (cfg.CHUNK_KB or 1024) * 1024
+  local heartbeat = (cfg.HEARTBEAT_MB or 32) * 1024 * 1024
   local parts = M.split_parts(r.size, split_bytes)
+
+  local processed, next_beat = 0, heartbeat
 
   for i, part in ipairs(parts) do
     local name = M.range_filename(r, i - 1, #parts)
@@ -247,6 +295,17 @@ function M.dump_range(mem, r, out_dir, cfg)
           result.partial = true
         end
         offset = offset + want
+      end
+
+      -- The renef client stops relaying output after ~5 s of silence, so
+      -- report progress at least every HEARTBEAT_MB. Ranges smaller than
+      -- HEARTBEAT_MB finish before the first beat and print nothing.
+      processed = processed + want
+      if processed >= next_beat then
+        M.log(string.format("[*] %x-%x %s ... %s / %s",
+          r.start_addr, r.end_addr, r.perms,
+          M.fmt_size(processed), M.fmt_size(r.size)))
+        next_beat = processed + heartbeat
       end
     end
 
@@ -299,6 +358,12 @@ function M.select_ranges(all, cfg)
   return selected, total
 end
 
+-- The completion sentinel payload: "ranges_done bytes_written bytes_gaps".
+-- The wrapper polls for a DONE file carrying this line before pulling.
+function M.done_line(stats)
+  return string.format("%d %d %d", stats.done, stats.written, stats.gaps)
+end
+
 -- Write the maps snapshot for this run into the output directory.
 function M.write_maps_copy(out_dir, maps_text)
   local f = io.open(out_dir .. "/maps.txt", "w")
@@ -349,8 +414,28 @@ function M.main()
     return
   end
 
-  local all = M.parse_maps(maps_text)
-  print(string.format("[*] parsed %s: %d ranges", M.MAPS_PATH, #all))
+  local all
+  local smaps_text = read_file(M.SMAPS_PATH)
+  if smaps_text then
+    all = M.parse_smaps(smaps_text)
+    print(string.format("[*] parsed %s: %d ranges", M.SMAPS_PATH, #all))
+  else
+    all = M.parse_maps(maps_text)
+    print(YELLOW .. "[-] cannot read " .. M.SMAPS_PATH .. " - residency filtering unavailable, treating every range as unknown" .. RESET)
+    print(string.format("[*] parsed %s: %d ranges", M.MAPS_PATH, #all))
+  end
+
+  local skipped_empty, skipped_empty_bytes = 0, 0
+  for _, r in ipairs(all) do
+    if r.rss == 0 then
+      skipped_empty = skipped_empty + 1
+      skipped_empty_bytes = skipped_empty_bytes + r.size
+    end
+  end
+  if skipped_empty > 0 then
+    print(string.format("[*] skipped %d non-resident ranges (%s of untouched reservations)",
+      skipped_empty, M.fmt_size(skipped_empty_bytes)))
+  end
 
   local selected, total = M.select_ranges(all, cfg)
   if #selected == 0 then
@@ -374,6 +459,9 @@ function M.main()
   end
   print("[*] " .. dir_msg)
 
+  -- A stale DONE from an earlier run must not count for this one.
+  os.remove(out_dir .. "/DONE")
+
   if not M.write_maps_copy(out_dir, maps_text) then
     print(RED .. "[-] cannot write maps.txt in " .. out_dir .. RESET)
     return
@@ -396,6 +484,14 @@ function M.main()
   print("")
   print(CYAN .. "[*] Run on host:" .. RESET)
   print(M.host_commands(out_dir))
+
+  -- Completion sentinel: written only on this success path, never on an
+  -- abort, so its presence means "the dump ran to completion".
+  local done = io.open(out_dir .. "/DONE", "w")
+  if done then
+    done:write(M.done_line(stats))
+    done:close()
+  end
 end
 
 if not _G.RENEFDUMP_TEST then

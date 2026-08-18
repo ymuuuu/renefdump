@@ -75,6 +75,36 @@ eq("parse_maps count", #list, 2)
 eq("parse_maps first path", list[1].path, "[heap]")
 eq("parse_maps second path", list[2].path, "/system/lib64/libc.so")
 
+-- parse_smaps -------------------------------------------------------------
+
+local smaps_sample = table.concat({
+  "76c0000000-7700000000 rw-p 00000000 00:00 0                              [anon:dalvik-LinearAlloc]",
+  "  Size:            1048576 kB",
+  "  KernelPageSize:        4 kB",
+  "  MMUPageSize:           4 kB",
+  "  Rss:                   0 kB",
+  "  Pss:                   0 kB",
+  "  Private_Dirty:         0 kB",
+  "  VmFlags: rd wr mr mw me ac",
+  "7700000000-7740000000 rw-p 00000000 00:00 0                              [anon:dalvik-LinearAlloc]",
+  "  Size:            1048576 kB",
+  "  Rss:                 512 kB",
+  "  VmFlags: rd wr mr mw me ac",
+  "7f8a2c0000-7f8a2e0000 rw-p 00000000 00:00 0                          [heap]",
+}, "\n")
+local srs = M.parse_smaps(smaps_sample)
+eq("smaps count", #srs, 3)
+eq("smaps block1 rss zero", srs[1].rss, 0)
+eq("smaps block1 start", srs[1].start_addr, 0x76c0000000)
+eq("smaps block1 size", srs[1].size, 0x40000000)
+eq("smaps block1 perms", srs[1].perms, "rw-p")
+eq("smaps block1 path", srs[1].path, "[anon:dalvik-LinearAlloc]")
+eq("smaps block2 rss", srs[2].rss, 512 * 1024)
+eq("smaps block3 rss default at EOF", srs[3].rss, 0)
+eq("smaps block3 path", srs[3].path, "[heap]")
+eq("smaps empty", #M.parse_smaps(""), 0)
+eq("smaps non-string", #M.parse_smaps(nil), 0)
+
 -- should_dump -------------------------------------------------------------
 
 local cfg_rw = { PERMS_FILTER = "rw", SKIP_FILE_BACKED = false }
@@ -111,6 +141,24 @@ check("anon kept when SKIP_FILE_BACKED",
 
 check("zero size skipped", not M.should_dump(range("rw-p", "", 0), cfg_rw))
 check("nil range skipped", not M.should_dump(nil, cfg_rw))
+
+-- SKIP_EMPTY: an explicit rss of 0 skips only when the flag is on; rss == nil
+-- (residency unknown) is never treated as empty.
+local cfg_skip_empty = { PERMS_FILTER = "rw", SKIP_FILE_BACKED = false, SKIP_EMPTY = true }
+local cfg_keep_empty = { PERMS_FILTER = "rw", SKIP_FILE_BACKED = false, SKIP_EMPTY = false }
+
+local rempty0 = range("rw-p", "[anon:dalvik-LinearAlloc]")
+rempty0.rss = 0
+check("rss 0 skipped when SKIP_EMPTY", not M.should_dump(rempty0, cfg_skip_empty))
+check("rss 0 kept when SKIP_EMPTY off", M.should_dump(rempty0, cfg_keep_empty))
+
+local rnil0 = range("rw-p", "[heap]")
+rnil0.rss = nil
+check("rss nil kept under SKIP_EMPTY", M.should_dump(rnil0, cfg_skip_empty))
+
+local rsome0 = range("rw-p", "[heap]")
+rsome0.rss = 4096
+check("rss nonzero kept under SKIP_EMPTY", M.should_dump(rsome0, cfg_skip_empty))
 
 -- sanitize_label ----------------------------------------------------------
 
@@ -269,6 +317,27 @@ check("open failure marks failed", bad.failed)
 eq("open failure written zero", bad.written, 0)
 eq("open failure no files", #bad.files, 0)
 
+-- Heartbeat: mid-range progress lines keep the renef client relaying output.
+local beat_lines = {}
+local saved_log = M.log
+M.log = function(msg) beat_lines[#beat_lines + 1] = msg end
+
+local hb_cfg = { SPLIT_MB = 1, CHUNK_KB = 64, HEARTBEAT_MB = 1 }
+local hb_range = { start_addr = 0, end_addr = 3 * 1024 * 1024, size = 3 * 1024 * 1024,
+                   perms = "rw-p", path = "[anon:heartbeat]" }
+
+-- A 2 KB range finishes before the first 1 MB beat: no heartbeat lines.
+M.dump_range(mem, small, out_dir, hb_cfg)
+eq("no heartbeat for small range", #beat_lines, 0)
+
+-- A 3 MB range with a 1 MB heartbeat fires exactly three lines.
+M.dump_range(mem, hb_range, out_dir, hb_cfg)
+M.log = saved_log
+
+eq("heartbeat count", #beat_lines, 3)
+eq("heartbeat first line", beat_lines[1], "[*] 0-300000 rw-p ... 1.0 MB / 3.0 MB")
+eq("heartbeat last line", beat_lines[3], "[*] 0-300000 rw-p ... 3.0 MB / 3.0 MB")
+
 -- dump_all ----------------------------------------------------------------
 
 local dstats = M.dump_all(mem, { small, past }, out_dir, dcfg)
@@ -277,6 +346,11 @@ eq("dump_all written", dstats.written, 2048)
 eq("dump_all gaps", dstats.gaps, 4096)
 eq("dump_all failed", dstats.failed, 0)
 eq("dump_all partial", dstats.partial, 1)
+
+-- done_line ---------------------------------------------------------------
+
+eq("done line", M.done_line({ done = 47, written = 205000000, gaps = 1024 }),
+   "47 205000000 1024")
 
 -- write_maps_copy ----------------------------------------------------------
 

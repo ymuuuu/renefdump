@@ -206,7 +206,44 @@ else
   printf 'exit\n' | "$RENEF_BIN" -s "$TARGET" -l "$TMP_LUA"
 fi
 
-# 7. The dump must have produced files on the device. A silent empty pull is
+# 7. The dump must signal completion before we pull: the Lua writes a DONE
+#    sentinel as its very last action, so its presence means the dump ran to
+#    completion. The client returning does NOT mean that (it stops relaying
+#    after ~5 s of silence), so wait for the sentinel - 2 s polls, 30 min
+#    ceiling - rather than trusting client exit.
+# An aborted run (size cap exceeded, unwritable directory, unreadable maps)
+# never writes DONE, and waiting the full ceiling for a failure that already
+# happened is useless. maps.txt is written before any range is dumped, so its
+# absence shortly after the client returns means the script never got that far.
+echo "[*] confirming the dump started..."
+START_WAIT=0
+while ! adb shell "ls '$DEV_DIR/maps.txt'" >/dev/null 2>&1; do
+  sleep 2
+  START_WAIT=$((START_WAIT + 2))
+  if [ "$START_WAIT" -ge 20 ]; then
+    echo "error: the dump never started - no maps.txt in $DEV_DIR after ${START_WAIT}s." >&2
+    echo "       The script aborted before dumping. Check the client output above:" >&2
+    echo "       a size cap, an unwritable output directory, or unreadable maps." >&2
+    exit 1
+  fi
+done
+
+echo "[*] waiting for the dump to signal completion (DONE sentinel)..."
+WAIT_SECS=0
+while ! adb shell "ls '$DEV_DIR/DONE'" >/dev/null 2>&1; do
+  sleep 2
+  WAIT_SECS=$((WAIT_SECS + 2))
+  if [ $((WAIT_SECS % 30)) -eq 0 ]; then
+    echo "[*] still waiting for the dump to finish (${WAIT_SECS}s)..."
+  fi
+  if [ "$WAIT_SECS" -ge 1800 ]; then
+    echo "error: no completion signal (DONE) after 30 minutes - refusing to pull a possibly truncated dump" >&2
+    exit 1
+  fi
+done
+echo "[*] dump complete signal received"
+
+# 8. The dump must have produced files on the device. A silent empty pull is
 #    the worst possible outcome, so fail loudly before pulling.
 NFILES=$(adb shell "ls -1 '$DEV_DIR' 2>/dev/null" | wc -l) || NFILES=0
 if [ "$NFILES" -eq 0 ]; then
@@ -215,7 +252,7 @@ if [ "$NFILES" -eq 0 ]; then
 fi
 echo "[*] $NFILES files on device"
 
-# 8. Pull the run directory into the local output parent.
+# 9. Pull the run directory into the local output parent.
 mkdir -p "$OUT_PARENT"
 LOCAL_DIR="$OUT_PARENT/$RUN_NAME"
 adb pull "$DEV_DIR" "$LOCAL_DIR"
@@ -229,7 +266,7 @@ if [ -d "$LOCAL_DIR/$RUN_NAME" ]; then
   mv "$LOCAL_DIR.tmp" "$LOCAL_DIR"
 fi
 
-# 9. Remove the device copy unless -k.
+# 10. Remove the device copy unless -k.
 if [ "$KEEP" -eq 0 ]; then
   adb shell "rm -rf '$DEV_DIR'"
   echo "[*] removed device copy: $DEV_DIR"
@@ -237,7 +274,7 @@ else
   echo "[*] kept device copy: $DEV_DIR"
 fi
 
-# 10. Summary.
+# 11. Summary.
 NFILES_LOCAL=$(find "$LOCAL_DIR" -maxdepth 1 -name '*.data' -type f | wc -l)
 SIZE_LOCAL=$(du -sh "$LOCAL_DIR" | cut -f1)
 echo
