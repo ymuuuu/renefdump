@@ -6,9 +6,11 @@ __pycache__/
 *.pyc
 .venv/
 
-# local dump output
+# local dump output - memory dumps can contain live credentials, never commit
 dump/
+dumps/
 *.data
+strings.txt
 
 # editors
 .vscode/

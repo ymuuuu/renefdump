@@ -24,14 +24,15 @@ rooted (KernelSU works; `adb root` is not required):
 > app has an empty heap, and Android freezes backgrounded apps (`cpuset:/background`), which
 > cannot run the injected agent at all.
 
-That produces `dumps/renefdump-<pid>-<timestamp>/` locally:
+That produces `dumps/<package>-<date>/` locally:
 
 ```
-dumps/renefdump-12847-20260818-143022/
-├── renefdump-12847-20260818-143022_7f8a2c0000-7f8a2e0000_rw-p_heap.data
-├── renefdump-12847-20260818-143022_7f9012a000-7f9012c000_rw-p_libart.so.data
+dumps/com.example.app-20260818-144908/
+├── renefdump-12847-20260818-144407_7f8a2c0000-7f8a2e0000_rw-p_heap.data
+├── renefdump-12847-20260818-144407_7f9012a000-7f9012c000_rw-p_libart.so.data
 ├── ...
-└── renefdump-12847-20260818-143022_maps.txt
+├── renefdump-12847-20260818-144407_maps.txt
+└── renefdump-12847-20260818-144407_DONE
 ```
 
 The `renefdump-<pid>-<ts>_` prefix is what lets the wrapper and the operator pick a run's
@@ -46,6 +47,63 @@ Other invocations:
 ./renefdump.sh -r <path> <package>    # path to the renef client binary
 ./renefdump.sh -k <package>           # keep the dump on the device (skip cleanup)
 ```
+
+## A real run
+
+Against a live app on a rooted Android 14 device, after logging in and leaving the app on
+screen:
+
+```
+$ ./renefdump.sh com.example.app
+[*] renef client: ../renef/build/renef
+[*] root: confirmed (su works)
+[*] run target: com.example.app
+[*] renef -a 12847 -l renefdump.lua  (pid of com.example.app)
+[*] Attaching to PID 12847...
+OK
+[*] renefdump - pid 12847
+[*] parsed /proc/self/smaps: 4696 ranges
+[*] skipped 507 non-resident ranges (1.3 GB of untouched reservations)
+[*] selected 803 ranges, 2.0 GB
+[*] selection is 2.0 GB, within the MAX_TOTAL_MB cap of 4096 MB
+[*] output: /data/data/com.example.app/cache
+[*] confirming the dump started...
+[*] waiting for the dump to signal completion (DONE sentinel)...
+[*] dump complete signal received
+[*] run: com.example.app-20260818-144908
+[*] app dir: /data/data/com.example.app/cache
+[*] 795 files on device
+32.4 MB/s (2125258156 bytes in 62.616s)
+[*] removed device copies (staging and app dir)
+
+[+] dump complete:
+    local:  ./dumps/com.example.app-20260818-144908
+    files:  793 .data files
+    size:   2.0G
+```
+
+The `DONE` sentinel for that run read `772 2124832768 4` — 772 ranges dumped,
+2,124,832,768 bytes written, 4 ranges failed. The bytes on disk matched the sentinel
+exactly, and every successful file was exactly `end - start` bytes.
+
+The 4 failures were all short-lived thread stacks
+(`[anon:stack_and_tls:29054]`, `[anon:thread signal stack]`, …) — threads that exited
+between reading smaps and writing the range, so the mapping was gone by the time
+`File.write` reached it. They produce zero-byte files, the run continues, the target
+survives, and the sentinel reports the count. That is the expected failure mode for a
+direct read against a live process; see *Why File.write* below.
+
+Then, on the host:
+
+```
+$ strings -n 8 dumps/com.example.app-20260818-144908/*.data | sort -u > strings.txt
+```
+
+That run yielded 231,863 unique strings from 2.0 GB of dumped memory.
+
+> Treat the output as sensitive. A memory dump of a logged-in app routinely contains
+> session tokens, keys, and personal data. `dumps/` and `strings.txt` are gitignored for
+> that reason.
 
 The wrapper resolves the renef client from `-r`, `$RENEF_BIN`, `./build/renef`,
 `../renef/build/renef`, or `renef` on PATH; verifies exactly one device is connected;
