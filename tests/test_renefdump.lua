@@ -174,18 +174,26 @@ eq("label keeps dots and dashes", M.sanitize_label("/system/lib64/libc++-hwasan.
 
 -- range_filename ----------------------------------------------------------
 
+local TP = "renefdump-123-20260818-133552_"
+
 local fr = { start_addr = 0x7f8a2c0000, end_addr = 0x7f8a2e0000,
              size = 0x20000, perms = "rw-p", path = "[heap]" }
-eq("filename single part", M.range_filename(fr, 0, 1),
-   "7f8a2c0000-7f8a2e0000_rw-p_heap.data")
-eq("filename part 0", M.range_filename(fr, 0, 3),
-   "7f8a2c0000-7f8a2e0000_rw-p_heap.part0.data")
-eq("filename part 2", M.range_filename(fr, 2, 3),
-   "7f8a2c0000-7f8a2e0000_rw-p_heap.part2.data")
+eq("filename single part", M.range_filename(TP, fr, 0, 1),
+   "renefdump-123-20260818-133552_7f8a2c0000-7f8a2e0000_rw-p_heap.data")
+eq("filename part 0", M.range_filename(TP, fr, 0, 3),
+   "renefdump-123-20260818-133552_7f8a2c0000-7f8a2e0000_rw-p_heap.part0.data")
+eq("filename part 2", M.range_filename(TP, fr, 2, 3),
+   "renefdump-123-20260818-133552_7f8a2c0000-7f8a2e0000_rw-p_heap.part2.data")
 
 local fanon = { start_addr = 0x1000, end_addr = 0x2000, size = 0x1000,
                 perms = "rw-p", path = "" }
-eq("filename anon", M.range_filename(fanon, 0, 1), "1000-2000_rw-p_anon.data")
+eq("filename anon", M.range_filename(TP, fanon, 0, 1),
+   "renefdump-123-20260818-133552_1000-2000_rw-p_anon.data")
+
+-- run_prefix ---------------------------------------------------------------
+
+eq("run prefix shape", M.run_prefix(123, "20260818-133552"),
+   "renefdump-123-20260818-133552_")
 
 -- split_parts -------------------------------------------------------------
 
@@ -251,7 +259,7 @@ local mem = assert(io.open(mem_path, "rb"))
 -- A 2 KB range starting at offset 4096.
 local small = { start_addr = 4096, end_addr = 4096 + 2048, size = 2048,
                 perms = "rw-p", path = "[heap]" }
-local res = M.dump_range(mem, small, out_dir, dcfg)
+local res = M.dump_range(mem, small, out_dir, TP, dcfg)
 eq("small range written", res.written, 2048)
 check("small range not failed", not res.failed)
 eq("small range one file", #res.files, 1)
@@ -265,7 +273,7 @@ eq("small dump content", content:sub(1, 4), "ABCD")
 -- A 2.5 MB range that must split into three 1 MB parts.
 local big = { start_addr = 0, end_addr = 2621440, size = 2621440,
               perms = "rw-p", path = "" }
-local bres = M.dump_range(mem, big, out_dir, dcfg)
+local bres = M.dump_range(mem, big, out_dir, TP, dcfg)
 eq("big range written", bres.written, 2621440)
 eq("big range parts", #bres.files, 3)
 check("big part0 named", bres.files[1]:find("part0", 1, true) ~= nil, bres.files[1])
@@ -283,7 +291,7 @@ eq("big parts sum on disk", total_on_disk, 2621440)
 -- the range is not abandoned.
 local past = { start_addr = 3 * 1024 * 1024, end_addr = 3 * 1024 * 1024 + 4096,
                size = 4096, perms = "rw-p", path = "[stack]" }
-local pres = M.dump_range(mem, past, out_dir, dcfg)
+local pres = M.dump_range(mem, past, out_dir, TP, dcfg)
 check("past-end marked partial", pres.partial)
 check("past-end did not error", pres.failed == false)
 check("past-end has gaps", pres.gaps > 0)
@@ -299,7 +307,7 @@ check("past-end file all zero", pcontent == string.rep("\0", 4096))
 local straddle = { start_addr = 3 * 1024 * 1024 - 2048,
                    end_addr = 3 * 1024 * 1024 - 2048 + 8192,
                    size = 8192, perms = "rw-p", path = "[anon:straddle]" }
-local sres = M.dump_range(mem, straddle, out_dir, dcfg)
+local sres = M.dump_range(mem, straddle, out_dir, TP, dcfg)
 check("straddle marked partial", sres.partial)
 eq("straddle written", sres.written, 2048)
 eq("straddle gaps", sres.gaps, 6144)
@@ -312,7 +320,7 @@ eq("straddle keeps data", scontent:sub(1, 4), "ABCD")
 eq("straddle zero tail", scontent:sub(2049, 2052), "\0\0\0\0")
 
 -- Output-open failure: failed, nothing written, no files listed.
-local bad = M.dump_range(mem, small, test_dir .. "/no-such-out", dcfg)
+local bad = M.dump_range(mem, small, test_dir .. "/no-such-out", TP, dcfg)
 check("open failure marks failed", bad.failed)
 eq("open failure written zero", bad.written, 0)
 eq("open failure no files", #bad.files, 0)
@@ -327,11 +335,11 @@ local hb_range = { start_addr = 0, end_addr = 3 * 1024 * 1024, size = 3 * 1024 *
                    perms = "rw-p", path = "[anon:heartbeat]" }
 
 -- A 2 KB range finishes before the first 1 MB beat: no heartbeat lines.
-M.dump_range(mem, small, out_dir, hb_cfg)
+M.dump_range(mem, small, out_dir, TP, hb_cfg)
 eq("no heartbeat for small range", #beat_lines, 0)
 
 -- A 3 MB range with a 1 MB heartbeat fires exactly three lines.
-M.dump_range(mem, hb_range, out_dir, hb_cfg)
+M.dump_range(mem, hb_range, out_dir, TP, hb_cfg)
 M.log = saved_log
 
 eq("heartbeat count", #beat_lines, 3)
@@ -340,7 +348,7 @@ eq("heartbeat last line", beat_lines[3], "[*] 0-300000 rw-p ... 3.0 MB / 3.0 MB"
 
 -- dump_all ----------------------------------------------------------------
 
-local dstats = M.dump_all(mem, { small, past }, out_dir, dcfg)
+local dstats = M.dump_all(mem, { small, past }, out_dir, TP, dcfg)
 eq("dump_all done", dstats.done, 2)
 eq("dump_all written", dstats.written, 2048)
 eq("dump_all gaps", dstats.gaps, 4096)
@@ -356,42 +364,38 @@ eq("done line", M.done_line({ done = 47, written = 205000000, gaps = 1024 }),
 
 local wmc_dir = test_dir .. "/wmc"
 os.execute("mkdir -p '" .. wmc_dir .. "'")
-check("write_maps_copy ok", M.write_maps_copy(wmc_dir, "fake maps text"))
-local wmc_f = io.open(wmc_dir .. "/maps.txt", "r")
-check("write_maps_copy writes maps.txt", wmc_f ~= nil)
+check("write_maps_copy ok", M.write_maps_copy(wmc_dir, TP, "fake maps text"))
+local wmc_f = io.open(wmc_dir .. "/" .. TP .. "maps.txt", "r")
+check("write_maps_copy writes prefixed maps.txt", wmc_f ~= nil)
 if wmc_f then
   eq("write_maps_copy content", wmc_f:read("a"), "fake maps text")
   wmc_f:close()
 end
 check("write_maps_copy fails on missing dir",
-      not M.write_maps_copy(wmc_dir .. "/nope", "x"))
+      not M.write_maps_copy(wmc_dir .. "/nope", TP, "x"))
 
 mem:close()
 os.execute("rm -rf '" .. test_dir .. "'")
 
--- check_out_dir ------------------------------------------------------------
+-- count_skipped_empty ------------------------------------------------------
 
-local cd_dir = tmp .. "/renefdump-out-test-" .. tostring(os.time())
-os.execute("mkdir -p '" .. cd_dir .. "'")
+local empty_cfg = { PERMS_FILTER = "rw", SKIP_FILE_BACKED = false, SKIP_EMPTY = true }
+local mixed_empty = {
+  range("---p", ""),                    -- non-readable, rss 0: NOT counted
+  range("rw-p", "[heap]", 8192),        -- rw, rss 0: counted
+  range("rw-p", "/dev/kgsl-3d0"),       -- /dev, rss 0: NOT counted
+}
+for _, r in ipairs(mixed_empty) do r.rss = 0 end
+local ne, be = M.count_skipped_empty(mixed_empty, empty_cfg)
+eq("skipped-empty counts only passable", ne, 1)
+eq("skipped-empty bytes", be, 8192)
+local ne_off = M.count_skipped_empty(mixed_empty,
+  { PERMS_FILTER = "rw", SKIP_FILE_BACKED = false, SKIP_EMPTY = false })
+eq("skipped-empty zero when SKIP_EMPTY off", ne_off, 0)
 
-local okcd, msgcd = M.check_out_dir(cd_dir)
-check("check_out_dir ok on writable dir", okcd)
-check("check_out_dir ok message has dir", msgcd and msgcd:find(cd_dir, 1, true) ~= nil, msgcd)
-local probe = io.open(cd_dir .. "/.renefdump-probe", "r")
-check("check_out_dir removes probe", probe == nil)
-if probe then probe:close() end
-
-local missing = cd_dir .. "/does-not-exist"
-local okmiss, msgmiss = M.check_out_dir(missing)
-check("check_out_dir fails on missing dir", not okmiss)
-check("check_out_dir message has adb root",
-      msgmiss and msgmiss:find("adb root", 1, true) ~= nil, msgmiss)
-check("check_out_dir message has mkdir cmd",
-      msgmiss and msgmiss:find("adb shell mkdir -p " .. missing, 1, true) ~= nil, msgmiss)
-check("check_out_dir message has chmod cmd",
-      msgmiss and msgmiss:find("adb shell chmod 777 " .. missing, 1, true) ~= nil, msgmiss)
-
-os.execute("rm -rf '" .. cd_dir .. "'")
+local nerr = M.count_skipped_empty({ range("rw-p", "[heap]", 4096) },
+  { PERMS_FILTER = "rw", SKIP_FILE_BACKED = false, SKIP_EMPTY = true })
+eq("skipped-empty ignores resident range", nerr, 0)
 
 -- select_ranges ------------------------------------------------------------
 
@@ -411,32 +415,77 @@ check("select keeps heap", ssel[2].path == "[heap]")
 -- config and entry point --------------------------------------------------
 
 check("config table exists", type(M.config) == "table")
+check("OUT_DIR removed from config", M.config.OUT_DIR == nil)
+check("resolve_out_dir removed", M.resolve_out_dir == nil)
+check("check_out_dir removed", M.check_out_dir == nil)
 
--- resolve_out_dir ----------------------------------------------------------
+-- read_package and app_dir -------------------------------------------------
 
-local saved_out_dir = _G.RENEFDUMP_OUT_DIR
-local ro_cfg = { OUT_DIR = "/data/local/tmp/renefdump" }
+local app_tmp = tmp .. "/renefdump-app-test-" .. tostring(os.time())
+os.execute("mkdir -p '" .. app_tmp .. "'")
 
-_G.RENEFDUMP_OUT_DIR = nil
-eq("resolve out dir default", M.resolve_out_dir(ro_cfg), "/data/local/tmp/renefdump")
-_G.RENEFDUMP_OUT_DIR = "/data/local/tmp/renefdump/com.example.app-20260818-143022"
-eq("resolve out dir override", M.resolve_out_dir(ro_cfg),
-   "/data/local/tmp/renefdump/com.example.app-20260818-143022")
-_G.RENEFDUMP_OUT_DIR = ""
-eq("resolve out dir empty falls back", M.resolve_out_dir(ro_cfg), "/data/local/tmp/renefdump")
-_G.RENEFDUMP_OUT_DIR = saved_out_dir
+local cmdline_path = app_tmp .. "/cmdline"
+local cmdline_f = assert(io.open(cmdline_path, "wb"))
+cmdline_f:write("com.example.app\0")
+cmdline_f:close()
+
+local app_real = app_tmp .. "/real"
+os.execute("mkdir -p '" .. app_real .. "/com.example.app'")
+local app_missing = app_tmp .. "/missing"
+
+local saved_cmdline = M.CMDLINE_PATH
+local saved_candidates = M.OUT_CANDIDATES
+M.CMDLINE_PATH = cmdline_path
+
+eq("package from fake cmdline", M.read_package(), "com.example.app")
+
+local sub_cmdline = app_tmp .. "/cmdline-sub"
+local sub_f = assert(io.open(sub_cmdline, "wb"))
+sub_f:write("com.example.app:remote\0")
+sub_f:close()
+M.CMDLINE_PATH = sub_cmdline
+eq("package strips :subprocess", M.read_package(), "com.example.app")
+M.CMDLINE_PATH = cmdline_path
+
+M.OUT_CANDIDATES = { app_missing .. "/%s", app_real .. "/%s" }
+eq("app_dir picks first writable candidate", M.app_dir(), app_real .. "/com.example.app")
+
+M.OUT_CANDIDATES = { app_missing .. "/%s" }
+eq("app_dir nil when no candidate writable", M.app_dir(), nil)
+
+M.OUT_CANDIDATES = { app_real .. "/%s" }
+check("app_dir leaves no probe behind",
+      io.open(app_real .. "/com.example.app/.renefdump-probe", "r") == nil)
+
+M.CMDLINE_PATH = saved_cmdline
+M.OUT_CANDIDATES = saved_candidates
+
+local nocmdline = app_tmp .. "/no-cmdline"
+M.CMDLINE_PATH = nocmdline
+eq("app_dir nil when cmdline unreadable", M.app_dir(), nil)
+M.CMDLINE_PATH = saved_cmdline
+
+os.execute("rm -rf '" .. app_tmp .. "'")
 
 check("get_pid returns a number", type(M.get_pid()) == "number")
 check("get_pid is positive", M.get_pid() > 0)
 
-local hc = M.host_commands("/data/local/tmp/renefdump/run")
-check("host commands mention adb pull",
-      hc:find("adb pull /data/local/tmp/renefdump/run ./dump", 1, true) ~= nil, hc)
-check("host commands mention rm -rf",
-      hc:find("adb shell rm -rf /data/local/tmp/renefdump/run", 1, true) ~= nil, hc)
-check("host commands contain no tar", hc:find("tar", 1, true) == nil, hc)
-check("host commands contain no exec-out", hc:find("exec-out", 1, true) == nil, hc)
-check("host commands are two lines", (hc:gsub("[^\n]", "")) == "\n")
+-- host_commands ------------------------------------------------------------
+
+local hc = M.host_commands("/data/data/com.example.app/cache", "renefdump-123-20260818-133552_")
+check("host commands stage via su",
+      hc:find('adb shell su -c "mkdir -p /data/local/tmp/renefdump-123-20260818-133552', 1, true) ~= nil, hc)
+check("host commands cp from app dir",
+      hc:find('cp /data/data/com.example.app/cache/renefdump-123-20260818-133552_*', 1, true) ~= nil, hc)
+check("host commands chmod staging dir",
+      hc:find('chmod -R 777 /data/local/tmp/renefdump-123-20260818-133552"', 1, true) ~= nil, hc)
+check("host commands pull from staging dir",
+      hc:find("adb pull /data/local/tmp/renefdump-123-20260818-133552 ./dump", 1, true) ~= nil, hc)
+check("host commands clean staging and app copy",
+      hc:find('rm -rf /data/local/tmp/renefdump-123-20260818-133552 /data/data/com.example.app/cache/renefdump-123-20260818-133552_*', 1, true) ~= nil, hc)
+check("host commands contain no bare adb pull of app dir",
+      hc:find("adb pull /data/data/", 1, true) == nil, hc)
+check("host commands are three lines", (hc:gsub("[^\n]", "")) == "\n\n")
 
 check("main not run under test guard", _G.RENEFDUMP_RAN == nil)
 

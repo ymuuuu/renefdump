@@ -6,6 +6,11 @@
 # client (which ships the script's source over the socket - the .lua file is
 # never copied to the device), then pulls the device-side dump to the host.
 #
+# The dump lands in the app's own private directory (the only place an
+# untrusted_app may write under SELinux), which plain adb pull cannot read,
+# so retrieval goes through `adb shell su`: the files are staged to
+# /data/local/tmp and pulled from there. Root is therefore required.
+#
 # Usage:
 #   ./renefdump.sh <package>              # spawn the app, dump, pull
 #   ./renefdump.sh -a <pid>               # attach to a running pid instead
@@ -151,15 +156,35 @@ verify_adb() {
 
 verify_adb
 
-# 3. Target label used for the run directory name.
+# 3. Root is required to retrieve the dump from the app's private directory.
+#    Do not rely on `adb root` (KernelSU devices do not need it and may not
+#    support it); `su` is the retrieval path.
+check_root() {
+  local id
+  id=$(adb shell su -c id 2>/dev/null) || true
+  case "$id" in
+    *uid=0*)
+      return 0
+      ;;
+  esac
+  echo "error: root required: the dump lands in the app's private directory, which adb pull cannot read" >&2
+  echo "       ('adb shell su -c id' did not report uid=0). Ensure a root manager such as KernelSU is active." >&2
+  return 1
+}
+
+check_root
+echo "[*] root: confirmed (su works)"
+
+# 4. Target label. In spawn mode it is the package argument; in attach mode
+#    the first NUL-delimited field of /proc/<pid>/cmdline, minus any
+#    ":<subprocess>" suffix (Android names them "com.foo:remote"); fall back
+#    to pid<N>. This matches what the Lua script derives on-device, so the
+#    candidate app directories line up.
 target_label() {
   if [ "$MODE" = spawn ]; then
     printf '%s\n' "$TARGET"
     return 0
   fi
-  # First NUL-delimited field of /proc/<pid>/cmdline, minus any
-  # ":<subprocess>" suffix (Android names them "com.foo:remote"); fall
-  # back to pid<N>.
   local cmdline
   cmdline=$(adb shell cat /proc/"$TARGET"/cmdline 2>/dev/null | tr '\0' '\n' | head -n 1)
   if [ -z "$cmdline" ]; then
@@ -174,63 +199,68 @@ target_label() {
   fi
 }
 
-LABEL=$(target_label)
-RUN_NAME="$LABEL-$(date +%Y%m%d-%H%M%S)"
-DEV_DIR="/data/local/tmp/renefdump/$RUN_NAME"
+PKG=$(target_label)
+echo "[*] run target: $PKG"
 
-echo "[*] run: $RUN_NAME"
-echo "[*] device dir: $DEV_DIR"
-
-# 4. Root the adb daemon (tolerate failure: already root, or the build does
-#    not support it), then create the per-run device directory.
-adb root >/dev/null 2>&1 || true
-adb shell "mkdir -p '$DEV_DIR' && chmod 777 '$DEV_DIR'"
-
-# 5. Build a temporary Lua: a RENEFDUMP_OUT_DIR override line in front of the
-#    script's own source. Removed by the trap on any exit path.
-TMP_LUA_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_LUA_DIR"' EXIT
-TMP_LUA="$TMP_LUA_DIR/renefdump.lua"
-{
-  printf 'RENEFDUMP_OUT_DIR = "%s"\n' "$DEV_DIR"
-  cat "$LUA_SCRIPT"
-} > "$TMP_LUA"
-
-# 6. Run the client one-shot; feed 'exit' so it does not sit in the REPL.
-#    Its output goes straight to the terminal so progress shows live.
+# 5. Run the client one-shot; feed 'exit' so it does not sit in the REPL.
+#    Its output goes straight to the terminal so progress shows live. The
+#    script is passed directly - it picks its own output directory on-device.
 if [ "$MODE" = attach ]; then
-  echo "[*] renef -a $TARGET -l <tmp.lua>"
-  printf 'exit\n' | "$RENEF_BIN" -a "$TARGET" -l "$TMP_LUA"
+  echo "[*] renef -a $TARGET -l renefdump.lua"
+  printf 'exit\n' | "$RENEF_BIN" -a "$TARGET" -l "$LUA_SCRIPT"
 else
-  echo "[*] renef -s $TARGET -l <tmp.lua>"
-  printf 'exit\n' | "$RENEF_BIN" -s "$TARGET" -l "$TMP_LUA"
+  echo "[*] renef -s $TARGET -l renefdump.lua"
+  printf 'exit\n' | "$RENEF_BIN" -s "$TARGET" -l "$LUA_SCRIPT"
 fi
 
-# 7. The dump must signal completion before we pull: the Lua writes a DONE
-#    sentinel as its very last action, so its presence means the dump ran to
-#    completion. The client returning does NOT mean that (it stops relaying
-#    after ~5 s of silence), so wait for the sentinel - 2 s polls, 30 min
-#    ceiling - rather than trusting client exit.
-# An aborted run (size cap exceeded, unwritable directory, unreadable maps)
-# never writes DONE, and waiting the full ceiling for a failure that already
-# happened is useless. maps.txt is written before any range is dumped, so its
-# absence shortly after the client returns means the script never got that far.
+# 6. The wrapper never learns the pid the script used, so it cannot know the
+#    prefix. It locates the run by globbing our marker across the candidate
+#    app directories, in the same order the script tries them. Spawn mode
+#    cannot query /proc/<pid>/cmdline before the run, so this glob is the
+#    only option. The literal `renefdump-` prefix is what keeps the app's own
+#    files out of the match.
+APP_DIR_CANDIDATES="/data/data/$PKG/cache /data/user/0/$PKG/cache /data/data/$PKG/files /data/data/$PKG"
+
+find_app_dir() {
+  # $1 = filename glob inside the app dir, e.g. 'renefdump-*_maps.txt'
+  local dir
+  for dir in $APP_DIR_CANDIDATES; do
+    if adb shell su -c "ls '$dir'/$1 2>/dev/null" | grep -q .; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 7. The dump must have started before we wait for completion. maps.txt is
+#    written before any range is dumped, so its absence shortly after the
+#    client returns means the script never got that far (size cap exceeded,
+#    no writable app directory, unreadable maps - all abort without writing).
 echo "[*] confirming the dump started..."
+MAPS_DIR=""
 START_WAIT=0
-while ! adb shell "ls '$DEV_DIR/maps.txt'" >/dev/null 2>&1; do
+while [ -z "$MAPS_DIR" ]; do
   sleep 2
   START_WAIT=$((START_WAIT + 2))
+  MAPS_DIR=$(find_app_dir 'renefdump-*_maps.txt' || true)
   if [ "$START_WAIT" -ge 20 ]; then
-    echo "error: the dump never started - no maps.txt in $DEV_DIR after ${START_WAIT}s." >&2
+    echo "error: the dump never started - no renefdump-*_maps.txt in any app directory after ${START_WAIT}s." >&2
     echo "       The script aborted before dumping. Check the client output above:" >&2
-    echo "       a size cap, an unwritable output directory, or unreadable maps." >&2
+    echo "       a size cap, no writable app directory, or unreadable maps." >&2
     exit 1
   fi
 done
 
+# 8. The dump must signal completion before we pull: the Lua writes a DONE
+#    sentinel as its very last action, so its presence means the dump ran to
+#    completion. The client returning does NOT mean that (it stops relaying
+#    after ~5 s of silence), so wait for the sentinel - 2 s polls, 30 min
+#    ceiling. The newest DONE wins, so a run left behind by -k is not
+#    mistaken for this one.
 echo "[*] waiting for the dump to signal completion (DONE sentinel)..."
 WAIT_SECS=0
-while ! adb shell "ls '$DEV_DIR/DONE'" >/dev/null 2>&1; do
+while ! adb shell su -c "ls -t '$MAPS_DIR'/renefdump-*_DONE 2>/dev/null" | grep -q .; do
   sleep 2
   WAIT_SECS=$((WAIT_SECS + 2))
   if [ $((WAIT_SECS % 30)) -eq 0 ]; then
@@ -243,38 +273,60 @@ while ! adb shell "ls '$DEV_DIR/DONE'" >/dev/null 2>&1; do
 done
 echo "[*] dump complete signal received"
 
-# 8. The dump must have produced files on the device. A silent empty pull is
-#    the worst possible outcome, so fail loudly before pulling.
-NFILES=$(adb shell "ls -1 '$DEV_DIR' 2>/dev/null" | wc -l) || NFILES=0
+# `ls <dir>/<glob>` prints full paths, and adb shell terminates lines with
+# CRLF, so reduce to a bare basename before deriving the prefix from it.
+DONE_NAME=$(adb shell su -c "ls -t '$MAPS_DIR'/renefdump-*_DONE 2>/dev/null" \
+  | head -n 1 | tr -d '\r' | sed 's|.*/||')
+PREFIX="${DONE_NAME%DONE}"     # "renefdump-<pid>-<ts>_"
+case "$PREFIX" in
+  renefdump-*_) ;;
+  *)
+    echo "error: could not derive the run prefix from device sentinel '$DONE_NAME'" >&2
+    exit 1
+    ;;
+esac
+
+# The device staging directory is named after the run's own prefix, but the
+# local directory keeps the package-and-date convention the operator asked for.
+STAGE_NAME="${PREFIX%_}"                       # renefdump-<pid>-<ts>
+RUN_NAME="$PKG-$(date +%Y%m%d-%H%M%S)"         # com.example.app-20260818-143022
+echo "[*] run: $RUN_NAME"
+echo "[*] app dir: $MAPS_DIR"
+
+# 9. The dump must have produced files on the device. A silent empty pull is
+#    the worst possible outcome, so fail loudly before staging.
+NFILES=$(adb shell su -c "ls -1 '$MAPS_DIR'/${PREFIX}* 2>/dev/null" | wc -l) || NFILES=0
 if [ "$NFILES" -eq 0 ]; then
-  echo "error: the client run produced no files in $DEV_DIR - nothing to pull" >&2
+  echo "error: the run produced no files in $MAPS_DIR for prefix $PREFIX - nothing to pull" >&2
   exit 1
 fi
 echo "[*] $NFILES files on device"
 
-# 9. Pull the run directory into the local output parent.
+# 10. Stage the files where adb pull can reach them, then pull.
+adb shell su -c "mkdir -p /data/local/tmp/$STAGE_NAME && cp '$MAPS_DIR'/${PREFIX}* /data/local/tmp/$STAGE_NAME/ && chmod -R 777 /data/local/tmp/$STAGE_NAME"
 mkdir -p "$OUT_PARENT"
 LOCAL_DIR="$OUT_PARENT/$RUN_NAME"
-adb pull "$DEV_DIR" "$LOCAL_DIR"
+adb pull "/data/local/tmp/$STAGE_NAME" "$LOCAL_DIR"
 
 # Some adb versions create <dest>/<remote-dirname> instead of copying the
 # contents directly into <dest>; normalize so the layout is
 # $LOCAL_DIR/*.data with no doubled directory level.
-if [ -d "$LOCAL_DIR/$RUN_NAME" ]; then
-  mv "$LOCAL_DIR/$RUN_NAME" "$LOCAL_DIR.tmp"
+if [ -d "$LOCAL_DIR/$STAGE_NAME" ]; then
+  mv "$LOCAL_DIR/$STAGE_NAME" "$LOCAL_DIR.tmp"
   rmdir "$LOCAL_DIR"
   mv "$LOCAL_DIR.tmp" "$LOCAL_DIR"
 fi
 
-# 10. Remove the device copy unless -k.
+# 11. Remove the device copies unless -k.
 if [ "$KEEP" -eq 0 ]; then
-  adb shell "rm -rf '$DEV_DIR'"
-  echo "[*] removed device copy: $DEV_DIR"
+  adb shell su -c "rm -rf /data/local/tmp/$STAGE_NAME '$MAPS_DIR'/${PREFIX}*"
+  echo "[*] removed device copies (staging and app dir)"
 else
-  echo "[*] kept device copy: $DEV_DIR"
+  adb shell su -c "rm -rf /data/local/tmp/$STAGE_NAME"
+  echo "[*] kept device copy in the app's private directory: $MAPS_DIR/${PREFIX}*"
 fi
 
-# 11. Summary.
+# 12. Summary.
 NFILES_LOCAL=$(find "$LOCAL_DIR" -maxdepth 1 -name '*.data' -type f | wc -l)
 SIZE_LOCAL=$(du -sh "$LOCAL_DIR" | cut -f1)
 echo

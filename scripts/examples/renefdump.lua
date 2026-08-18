@@ -3,8 +3,10 @@
 --   attach <pid>
 --   l scripts/examples/renefdump.lua
 --
--- Dumps writable memory ranges of the target process to the device, then
--- prints the adb commands to pull them to the host.
+-- Dumps writable memory ranges of the target process into the app's own
+-- writable directory (SELinux: an untrusted_app cannot write shell_data_file,
+-- so /data/local/tmp is off-limits regardless of chmod), then prints the su
+-- commands to stage and pull them to the host.
 
 local M = {}
 
@@ -12,7 +14,6 @@ local M = {}
 -- renef's `l` command passes no arguments, so tune the dump here.
 
 M.config = {
-  OUT_DIR          = "/data/local/tmp/renefdump", -- output directory (default; the wrapper overrides it per run via RENEFDUMP_OUT_DIR)
   PERMS_FILTER     = "rw",              -- "rw" = writable only (fridump default), "r" = any readable
   SKIP_FILE_BACKED = false,             -- true = anon/heap/stack only, skips mapped .so/.dex/.apk
   SKIP_EMPTY       = true,              -- true = skip ranges with Rss: 0 (untouched ART reservations)
@@ -26,6 +27,18 @@ M.config = {
 M.MAPS_PATH  = "/proc/self/maps"
 M.SMAPS_PATH = "/proc/self/smaps"
 M.MEM_PATH   = "/proc/self/mem"
+M.CMDLINE_PATH = "/proc/self/cmdline"
+
+-- Where the dump may live, tried in order. %s is the package name read from
+-- cmdline. All are inside the app's own storage, whose SELinux label
+-- (app_data_file) an untrusted_app may write - unlike /data/local/tmp
+-- (shell_data_file), which an enforcing device denies even at mode 0777.
+M.OUT_CANDIDATES = {
+  "/data/data/%s/cache",
+  "/data/user/0/%s/cache",
+  "/data/data/%s/files",
+  "/data/data/%s",
+}
 
 -- Color globals exist inside the renef agent but not on a bare host interpreter.
 local CYAN   = _G.CYAN or "\27[36m"
@@ -115,8 +128,10 @@ local function always_skip(path)
   return false
 end
 
--- Decide whether a range should be dumped under the given config.
-function M.should_dump(r, cfg)
+-- Every range filter except the residency check. A range passing this but
+-- failing the residency check was skipped solely because it is non-resident
+-- - the only skip worth reporting (see M.count_skipped_empty).
+function M.should_dump_nonempty(r, cfg)
   if type(r) ~= "table" then return false end
   if not r.size or r.size <= 0 then return false end
   if type(r.perms) ~= "string" or #r.perms < 2 then return false end
@@ -124,13 +139,22 @@ function M.should_dump(r, cfg)
   if r.perms:sub(1, 1) ~= "r" then return false end
   if cfg.PERMS_FILTER == "rw" and r.perms:sub(2, 2) ~= "w" then return false end
 
-  -- rss == 0 means a never-touched reservation: it can only read as zeros.
-  -- rss == nil (residency unknown, e.g. plain maps fallback) is NOT skipped.
-  if cfg.SKIP_EMPTY and r.rss == 0 then return false end
-
   local path = r.path or ""
   if always_skip(path) then return false end
   if cfg.SKIP_FILE_BACKED and path:sub(1, 1) == "/" then return false end
+
+  return true
+end
+
+-- Decide whether a range should be dumped under the given config. The
+-- residency check is deliberately the last filter applied, so a skipped
+-- range can fail it and nothing else.
+function M.should_dump(r, cfg)
+  if not M.should_dump_nonempty(r, cfg) then return false end
+
+  -- rss == 0 means a never-touched reservation: it can only read as zeros.
+  -- rss == nil (residency unknown, e.g. plain maps fallback) is NOT skipped.
+  if cfg.SKIP_EMPTY and r.rss == 0 then return false end
 
   return true
 end
@@ -148,11 +172,18 @@ function M.sanitize_label(path)
   return base
 end
 
+-- Per-run filename prefix. The literal `renefdump-` lead is what lets the
+-- wrapper and the operator pick a run's files out of the app's cache
+-- directory, which also holds the app's own files.
+function M.run_prefix(pid, timestamp)
+  return string.format("renefdump-%d-%s_", pid, timestamp)
+end
+
 -- Build the output filename for one range (or one part of a split range).
 -- part_index is 0-based; no part suffix is added when part_count == 1.
-function M.range_filename(r, part_index, part_count)
-  local name = string.format("%x-%x_%s_%s",
-    r.start_addr, r.end_addr, r.perms, M.sanitize_label(r.path))
+function M.range_filename(prefix, r, part_index, part_count)
+  local name = string.format("%s%x-%x_%s_%s",
+    prefix, r.start_addr, r.end_addr, r.perms, M.sanitize_label(r.path))
   if part_count and part_count > 1 then
     name = name .. string.format(".part%d", part_index)
   end
@@ -205,33 +236,6 @@ function M.check_space(total_bytes, cfg)
     M.fmt_size(total_bytes), cap_mb)
 end
 
--- Verify the output directory exists and is writable. The script never
--- executes a shell, so directory creation is the operator's job from the
--- host; on failure the message carries the exact commands to run.
-function M.check_out_dir(dir)
-  local probe = dir .. "/.renefdump-probe"
-  local f, err = io.open(probe, "w")
-  if not f then
-    return false, string.format(
-      "cannot write to %s (%s). Run on the host:\n  adb root\n  adb shell mkdir -p %s && adb shell chmod 777 %s",
-      dir, tostring(err), dir, dir)
-  end
-  f:close()
-  os.remove(probe)
-  return true, "output directory is writable: " .. dir
-end
-
--- The output directory for a run. The PC-side wrapper pre-sets the
--- RENEFDUMP_OUT_DIR global to a fresh per-run directory; the config default
--- applies when it is unset or empty (manual `l` route).
-function M.resolve_out_dir(cfg)
-  local override = _G.RENEFDUMP_OUT_DIR
-  if type(override) == "string" and #override > 0 then
-    return override
-  end
-  return cfg.OUT_DIR
-end
-
 -- Heartbeat output hook; tests replace it with a collector. Used only for
 -- the mid-range progress lines so the renef client keeps relaying output.
 function M.log(msg)
@@ -248,7 +252,7 @@ end
 -- An unreadable chunk is zero-filled rather than dropped, so the output file
 -- is always exactly `end - start` bytes and file offsets keep matching
 -- address offsets. Zero-filled bytes are counted in `result.gaps`.
-function M.dump_range(mem, r, out_dir, cfg)
+function M.dump_range(mem, r, out_dir, prefix, cfg)
   local result = { written = 0, failed = false, partial = false, gaps = 0, files = {} }
 
   local split_bytes = (cfg.SPLIT_MB or 256) * 1024 * 1024
@@ -259,7 +263,7 @@ function M.dump_range(mem, r, out_dir, cfg)
   local processed, next_beat = 0, heartbeat
 
   for i, part in ipairs(parts) do
-    local name = M.range_filename(r, i - 1, #parts)
+    local name = M.range_filename(prefix, r, i - 1, #parts)
     local out = io.open(out_dir .. "/" .. name, "wb")
     if not out then
       result.failed = true
@@ -337,13 +341,17 @@ function M.get_pid()
   return 0
 end
 
--- The commands the operator runs on the host once the dump finishes.
--- Every run lands in its own directory, so a plain recursive pull works:
--- no glob, no tar stream, no exec-out.
-function M.host_commands(out_dir)
+-- The commands the operator runs on the host once the dump finishes. The
+-- files live in the app's private directory, which plain adb pull cannot
+-- read, so they are staged into /data/local/tmp via su (mode 0777 and
+-- pullable) first. Three commands, one per line.
+function M.host_commands(out_dir, prefix)
+  local run = prefix:gsub("_$", "")
   return string.format(
-    "  adb pull %s ./dump\n  adb shell rm -rf %s",
-    out_dir, out_dir)
+    "  adb shell su -c \"mkdir -p /data/local/tmp/%s && cp %s/%s* /data/local/tmp/%s/ && chmod -R 777 /data/local/tmp/%s\"\n" ..
+    "  adb pull /data/local/tmp/%s ./dump\n" ..
+    "  adb shell su -c \"rm -rf /data/local/tmp/%s %s/%s*\"",
+    run, out_dir, prefix, run, run, run, run, out_dir, prefix)
 end
 
 -- Apply the filter to a parsed maps list.
@@ -358,6 +366,23 @@ function M.select_ranges(all, cfg)
   return selected, total
 end
 
+-- Ranges skipped solely because they are non-resident: they pass every
+-- filter except the residency check. Counting every rss == 0 range in the
+-- address space inflated the figure with ranges the perms filter would
+-- never have selected, so the report reads as nonsense next to the
+-- selection it accompanies.
+function M.count_skipped_empty(all, cfg)
+  local n, bytes = 0, 0
+  if not cfg.SKIP_EMPTY then return n, bytes end
+  for _, r in ipairs(all) do
+    if r.rss == 0 and M.should_dump_nonempty(r, cfg) then
+      n = n + 1
+      bytes = bytes + r.size
+    end
+  end
+  return n, bytes
+end
+
 -- The completion sentinel payload: "ranges_done bytes_written bytes_gaps".
 -- The wrapper polls for a DONE file carrying this line before pulling.
 function M.done_line(stats)
@@ -365,8 +390,8 @@ function M.done_line(stats)
 end
 
 -- Write the maps snapshot for this run into the output directory.
-function M.write_maps_copy(out_dir, maps_text)
-  local f = io.open(out_dir .. "/maps.txt", "w")
+function M.write_maps_copy(out_dir, prefix, maps_text)
+  local f = io.open(out_dir .. "/" .. prefix .. "maps.txt", "w")
   if not f then return false end
   f:write(maps_text)
   f:close()
@@ -374,10 +399,10 @@ function M.write_maps_copy(out_dir, maps_text)
 end
 
 -- Dump every selected range and accumulate run-level stats.
-function M.dump_all(mem, selected, out_dir, cfg)
+function M.dump_all(mem, selected, out_dir, prefix, cfg)
   local stats = { written = 0, failed = 0, partial = 0, gaps = 0, done = 0 }
   for _, r in ipairs(selected) do
-    local res = M.dump_range(mem, r, out_dir, cfg)
+    local res = M.dump_range(mem, r, out_dir, prefix, cfg)
     stats.written = stats.written + res.written
     stats.gaps = stats.gaps + res.gaps
     if res.failed then stats.failed = stats.failed + 1 end
@@ -402,9 +427,44 @@ local function read_file(path)
   return content
 end
 
+-- Target package name: the first NUL-delimited field of /proc/self/cmdline,
+-- minus any ":<subprocess>" suffix (Android names those "com.foo:remote").
+-- The NUL scan is a byte loop because Lua 5.4 has no %z pattern class.
+function M.read_package()
+  local content = read_file(M.CMDLINE_PATH)
+  if not content then return nil end
+  local i = 1
+  while i <= #content and content:byte(i) ~= 0 do i = i + 1 end
+  local pkg = content:sub(1, i - 1)
+  pkg = pkg:match("^([^:]+)")
+  if not pkg or #pkg == 0 then return nil end
+  return pkg
+end
+
+-- The output directory for a run: the first candidate the app owns and can
+-- write to, probed the way the deleted check_out_dir did. App directories
+-- are the only place an untrusted_app may write on an enforcing device, so
+-- there is no setup step at all - the app's own directories always exist.
+function M.app_dir()
+  local pkg = M.read_package()
+  if not pkg then return nil end
+  for _, tmpl in ipairs(M.OUT_CANDIDATES) do
+    local dir = string.format(tmpl, pkg)
+    local probe = dir .. "/.renefdump-probe"
+    local f = io.open(probe, "w")
+    if f then
+      f:close()
+      os.remove(probe)
+      return dir
+    end
+  end
+  return nil
+end
+
 function M.main()
   local cfg = M.config
   local pid = M.get_pid()
+  local prefix = M.run_prefix(pid, os.date("%Y%m%d-%H%M%S"))
 
   print(CYAN .. "[*] renefdump - pid " .. tostring(pid) .. RESET)
 
@@ -425,13 +485,7 @@ function M.main()
     print(string.format("[*] parsed %s: %d ranges", M.MAPS_PATH, #all))
   end
 
-  local skipped_empty, skipped_empty_bytes = 0, 0
-  for _, r in ipairs(all) do
-    if r.rss == 0 then
-      skipped_empty = skipped_empty + 1
-      skipped_empty_bytes = skipped_empty_bytes + r.size
-    end
-  end
+  local skipped_empty, skipped_empty_bytes = M.count_skipped_empty(all, cfg)
   if skipped_empty > 0 then
     print(string.format("[*] skipped %d non-resident ranges (%s of untouched reservations)",
       skipped_empty, M.fmt_size(skipped_empty_bytes)))
@@ -451,19 +505,24 @@ function M.main()
     return
   end
 
-  local out_dir = M.resolve_out_dir(cfg)
-  local ok_dir, dir_msg = M.check_out_dir(out_dir)
-  if not ok_dir then
-    print(RED .. "[-] " .. dir_msg .. RESET)
+  local out_dir = M.app_dir()
+  if not out_dir then
+    local pkg = M.read_package() or "?"
+    local tried = {}
+    for _, tmpl in ipairs(M.OUT_CANDIDATES) do
+      tried[#tried + 1] = string.format(tmpl, pkg)
+    end
+    print(RED .. "[-] no writable app directory: tried "
+      .. table.concat(tried, ", ") .. " and none exists and is writable" .. RESET)
     return
   end
-  print("[*] " .. dir_msg)
+  print("[*] output: " .. out_dir)
 
   -- A stale DONE from an earlier run must not count for this one.
-  os.remove(out_dir .. "/DONE")
+  os.remove(out_dir .. "/" .. prefix .. "DONE")
 
-  if not M.write_maps_copy(out_dir, maps_text) then
-    print(RED .. "[-] cannot write maps.txt in " .. out_dir .. RESET)
+  if not M.write_maps_copy(out_dir, prefix, maps_text) then
+    print(RED .. "[-] cannot write " .. prefix .. "maps.txt in " .. out_dir .. RESET)
     return
   end
 
@@ -473,9 +532,7 @@ function M.main()
     return
   end
 
-  print("[*] output: " .. out_dir)
-
-  local stats = M.dump_all(mem, selected, out_dir, cfg)
+  local stats = M.dump_all(mem, selected, out_dir, prefix, cfg)
   mem:close()
 
   print(string.format("%s[+] %d/%d ranges, %s written, %s zero-filled, %d failed, %d partial%s",
@@ -483,11 +540,11 @@ function M.main()
     stats.failed, stats.partial, RESET))
   print("")
   print(CYAN .. "[*] Run on host:" .. RESET)
-  print(M.host_commands(out_dir))
+  print(M.host_commands(out_dir, prefix))
 
   -- Completion sentinel: written only on this success path, never on an
   -- abort, so its presence means "the dump ran to completion".
-  local done = io.open(out_dir .. "/DONE", "w")
+  local done = io.open(out_dir .. "/" .. prefix .. "DONE", "w")
   if done then
     done:write(M.done_line(stats))
     done:close()
