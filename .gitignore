@@ -1,0 +1,15 @@
+# upstream reference clone - not part of this project
+fridump3/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# local dump output
+dump/
+*.data
+
+# editors
+.vscode/
+.idea/
