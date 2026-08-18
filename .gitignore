@@ -12,6 +12,9 @@ dumps/
 *.data
 strings.txt
 
+# working notes, design records, manual test checklist - kept locally
+docs/
+
 # editors
 .vscode/
 .idea/
