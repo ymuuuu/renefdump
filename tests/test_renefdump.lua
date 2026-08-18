@@ -128,23 +128,16 @@ eq("label keeps dots and dashes", M.sanitize_label("/system/lib64/libc++-hwasan.
 
 local fr = { start_addr = 0x7f8a2c0000, end_addr = 0x7f8a2e0000,
              size = 0x20000, perms = "rw-p", path = "[heap]" }
-eq("filename single part", M.range_filename("12847-1755512400_", fr, 0, 1),
-   "12847-1755512400_7f8a2c0000-7f8a2e0000_rw-p_heap.data")
-eq("filename part 0", M.range_filename("12847-1755512400_", fr, 0, 3),
-   "12847-1755512400_7f8a2c0000-7f8a2e0000_rw-p_heap.part0.data")
-eq("filename part 2", M.range_filename("12847-1755512400_", fr, 2, 3),
-   "12847-1755512400_7f8a2c0000-7f8a2e0000_rw-p_heap.part2.data")
+eq("filename single part", M.range_filename(fr, 0, 1),
+   "7f8a2c0000-7f8a2e0000_rw-p_heap.data")
+eq("filename part 0", M.range_filename(fr, 0, 3),
+   "7f8a2c0000-7f8a2e0000_rw-p_heap.part0.data")
+eq("filename part 2", M.range_filename(fr, 2, 3),
+   "7f8a2c0000-7f8a2e0000_rw-p_heap.part2.data")
 
 local fanon = { start_addr = 0x1000, end_addr = 0x2000, size = 0x1000,
                 perms = "rw-p", path = "" }
-eq("filename anon", M.range_filename("12847-1755512400_", fanon, 0, 1),
-   "12847-1755512400_1000-2000_rw-p_anon.data")
-eq("filename empty prefix", M.range_filename("", fr, 0, 1),
-   "7f8a2c0000-7f8a2e0000_rw-p_heap.data")
-
--- run_prefix --------------------------------------------------------------
-
-eq("run prefix", M.run_prefix(12847, 1755512400), "12847-1755512400_")
+eq("filename anon", M.range_filename(fanon, 0, 1), "1000-2000_rw-p_anon.data")
 
 -- split_parts -------------------------------------------------------------
 
@@ -204,14 +197,13 @@ mf:close()
 local dcfg = { SPLIT_MB = 1, CHUNK_KB = 64 }
 local out_dir = test_dir .. "/out"
 os.execute("mkdir -p '" .. out_dir .. "'")
-local dprefix = "123-456_"
 
 local mem = assert(io.open(mem_path, "rb"))
 
 -- A 2 KB range starting at offset 4096.
 local small = { start_addr = 4096, end_addr = 4096 + 2048, size = 2048,
                 perms = "rw-p", path = "[heap]" }
-local res = M.dump_range(mem, small, out_dir, dprefix, dcfg)
+local res = M.dump_range(mem, small, out_dir, dcfg)
 eq("small range written", res.written, 2048)
 check("small range not failed", not res.failed)
 eq("small range one file", #res.files, 1)
@@ -225,12 +217,11 @@ eq("small dump content", content:sub(1, 4), "ABCD")
 -- A 2.5 MB range that must split into three 1 MB parts.
 local big = { start_addr = 0, end_addr = 2621440, size = 2621440,
               perms = "rw-p", path = "" }
-local bres = M.dump_range(mem, big, out_dir, dprefix, dcfg)
+local bres = M.dump_range(mem, big, out_dir, dcfg)
 eq("big range written", bres.written, 2621440)
 eq("big range parts", #bres.files, 3)
 check("big part0 named", bres.files[1]:find("part0", 1, true) ~= nil, bres.files[1])
 check("big part2 named", bres.files[3]:find("part2", 1, true) ~= nil, bres.files[3])
-check("big files prefixed", bres.files[1]:sub(1, #dprefix) == dprefix, bres.files[1])
 
 local total_on_disk = 0
 for _, name in ipairs(bres.files) do
@@ -244,7 +235,7 @@ eq("big parts sum on disk", total_on_disk, 2621440)
 -- the range is not abandoned.
 local past = { start_addr = 3 * 1024 * 1024, end_addr = 3 * 1024 * 1024 + 4096,
                size = 4096, perms = "rw-p", path = "[stack]" }
-local pres = M.dump_range(mem, past, out_dir, dprefix, dcfg)
+local pres = M.dump_range(mem, past, out_dir, dcfg)
 check("past-end marked partial", pres.partial)
 check("past-end did not error", pres.failed == false)
 check("past-end has gaps", pres.gaps > 0)
@@ -260,7 +251,7 @@ check("past-end file all zero", pcontent == string.rep("\0", 4096))
 local straddle = { start_addr = 3 * 1024 * 1024 - 2048,
                    end_addr = 3 * 1024 * 1024 - 2048 + 8192,
                    size = 8192, perms = "rw-p", path = "[anon:straddle]" }
-local sres = M.dump_range(mem, straddle, out_dir, dprefix, dcfg)
+local sres = M.dump_range(mem, straddle, out_dir, dcfg)
 check("straddle marked partial", sres.partial)
 eq("straddle written", sres.written, 2048)
 eq("straddle gaps", sres.gaps, 6144)
@@ -273,14 +264,14 @@ eq("straddle keeps data", scontent:sub(1, 4), "ABCD")
 eq("straddle zero tail", scontent:sub(2049, 2052), "\0\0\0\0")
 
 -- Output-open failure: failed, nothing written, no files listed.
-local bad = M.dump_range(mem, small, test_dir .. "/no-such-out", dprefix, dcfg)
+local bad = M.dump_range(mem, small, test_dir .. "/no-such-out", dcfg)
 check("open failure marks failed", bad.failed)
 eq("open failure written zero", bad.written, 0)
 eq("open failure no files", #bad.files, 0)
 
 -- dump_all ----------------------------------------------------------------
 
-local dstats = M.dump_all(mem, { small, past }, out_dir, dprefix, dcfg)
+local dstats = M.dump_all(mem, { small, past }, out_dir, dcfg)
 eq("dump_all done", dstats.done, 2)
 eq("dump_all written", dstats.written, 2048)
 eq("dump_all gaps", dstats.gaps, 4096)
@@ -291,15 +282,15 @@ eq("dump_all partial", dstats.partial, 1)
 
 local wmc_dir = test_dir .. "/wmc"
 os.execute("mkdir -p '" .. wmc_dir .. "'")
-check("write_maps_copy ok", M.write_maps_copy(wmc_dir, "123-456_", "fake maps text"))
-local wmc_f = io.open(wmc_dir .. "/123-456_maps.txt", "r")
-check("write_maps_copy file named with prefix", wmc_f ~= nil)
+check("write_maps_copy ok", M.write_maps_copy(wmc_dir, "fake maps text"))
+local wmc_f = io.open(wmc_dir .. "/maps.txt", "r")
+check("write_maps_copy writes maps.txt", wmc_f ~= nil)
 if wmc_f then
   eq("write_maps_copy content", wmc_f:read("a"), "fake maps text")
   wmc_f:close()
 end
 check("write_maps_copy fails on missing dir",
-      not M.write_maps_copy(wmc_dir .. "/nope", "123-456_", "x"))
+      not M.write_maps_copy(wmc_dir .. "/nope", "x"))
 
 mem:close()
 os.execute("rm -rf '" .. test_dir .. "'")
@@ -347,20 +338,31 @@ check("select keeps heap", ssel[2].path == "[heap]")
 
 check("config table exists", type(M.config) == "table")
 
+-- resolve_out_dir ----------------------------------------------------------
+
+local saved_out_dir = _G.RENEFDUMP_OUT_DIR
+local ro_cfg = { OUT_DIR = "/data/local/tmp/renefdump" }
+
+_G.RENEFDUMP_OUT_DIR = nil
+eq("resolve out dir default", M.resolve_out_dir(ro_cfg), "/data/local/tmp/renefdump")
+_G.RENEFDUMP_OUT_DIR = "/data/local/tmp/renefdump/com.example.app-20260818-143022"
+eq("resolve out dir override", M.resolve_out_dir(ro_cfg),
+   "/data/local/tmp/renefdump/com.example.app-20260818-143022")
+_G.RENEFDUMP_OUT_DIR = ""
+eq("resolve out dir empty falls back", M.resolve_out_dir(ro_cfg), "/data/local/tmp/renefdump")
+_G.RENEFDUMP_OUT_DIR = saved_out_dir
+
 check("get_pid returns a number", type(M.get_pid()) == "number")
 check("get_pid is positive", M.get_pid() > 0)
 
-local hc = M.host_commands("/data/local/tmp/renefdump", "123-456_")
-check("host commands mention mkdir dump", hc:find("mkdir -p ./dump", 1, true) ~= nil, hc)
-check("host commands mention tar pull", hc:find("tar cf -", 1, true) ~= nil, hc)
--- adb shell would translate LF to CRLF under its PTY and corrupt the tar stream.
-check("binary stream uses exec-out", hc:find("adb exec-out", 1, true) ~= nil, hc)
-check("binary stream avoids adb shell tar",
-      hc:find("adb shell \"cd", 1, true) == nil, hc)
-check("host commands mention rm", hc:find("rm -f", 1, true) ~= nil, hc)
-check("host commands contain the dir",
-      hc:find("/data/local/tmp/renefdump", 1, true) ~= nil, hc)
-check("host commands contain the prefix", hc:find("123-456_", 1, true) ~= nil, hc)
+local hc = M.host_commands("/data/local/tmp/renefdump/run")
+check("host commands mention adb pull",
+      hc:find("adb pull /data/local/tmp/renefdump/run ./dump", 1, true) ~= nil, hc)
+check("host commands mention rm -rf",
+      hc:find("adb shell rm -rf /data/local/tmp/renefdump/run", 1, true) ~= nil, hc)
+check("host commands contain no tar", hc:find("tar", 1, true) == nil, hc)
+check("host commands contain no exec-out", hc:find("exec-out", 1, true) == nil, hc)
+check("host commands are two lines", (hc:gsub("[^\n]", "")) == "\n")
 
 check("main not run under test guard", _G.RENEFDUMP_RAN == nil)
 

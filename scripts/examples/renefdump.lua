@@ -12,7 +12,7 @@ local M = {}
 -- renef's `l` command passes no arguments, so tune the dump here.
 
 M.config = {
-  OUT_DIR          = "/data/local/tmp/renefdump", -- output directory; must already exist (created from the host)
+  OUT_DIR          = "/data/local/tmp/renefdump", -- output directory (default; the wrapper overrides it per run via RENEFDUMP_OUT_DIR)
   PERMS_FILTER     = "rw",              -- "rw" = writable only (fridump default), "r" = any readable
   SKIP_FILE_BACKED = false,             -- true = anon/heap/stack only, skips mapped .so/.dex/.apk
   MAX_TOTAL_MB     = 1024,              -- abort if the selection exceeds this
@@ -110,20 +110,14 @@ function M.sanitize_label(path)
 end
 
 -- Build the output filename for one range (or one part of a split range).
--- prefix is the run's "<pid>-<timestamp>_" marker; part_index is 0-based;
--- no part suffix is added when part_count == 1.
-function M.range_filename(prefix, r, part_index, part_count)
-  local name = string.format("%s%x-%x_%s_%s",
-    prefix or "", r.start_addr, r.end_addr, r.perms, M.sanitize_label(r.path))
+-- part_index is 0-based; no part suffix is added when part_count == 1.
+function M.range_filename(r, part_index, part_count)
+  local name = string.format("%x-%x_%s_%s",
+    r.start_addr, r.end_addr, r.perms, M.sanitize_label(r.path))
   if part_count and part_count > 1 then
     name = name .. string.format(".part%d", part_index)
   end
   return name .. ".data"
-end
-
--- The filename prefix that separates one run's files from another's.
-function M.run_prefix(pid, timestamp)
-  return string.format("%d-%d_", pid, timestamp)
 end
 
 -- Split a range size into contiguous parts no larger than split_bytes.
@@ -188,6 +182,17 @@ function M.check_out_dir(dir)
   return true, "output directory is writable: " .. dir
 end
 
+-- The output directory for a run. The PC-side wrapper pre-sets the
+-- RENEFDUMP_OUT_DIR global to a fresh per-run directory; the config default
+-- applies when it is unset or empty (manual `l` route).
+function M.resolve_out_dir(cfg)
+  local override = _G.RENEFDUMP_OUT_DIR
+  if type(override) == "string" and #override > 0 then
+    return override
+  end
+  return cfg.OUT_DIR
+end
+
 -- Copy one range from `mem` (an open /proc/<pid>/mem style handle) to disk.
 --
 -- The handle is re-seeked before every chunk: a failed read on /proc/*/mem
@@ -198,7 +203,7 @@ end
 -- An unreadable chunk is zero-filled rather than dropped, so the output file
 -- is always exactly `end - start` bytes and file offsets keep matching
 -- address offsets. Zero-filled bytes are counted in `result.gaps`.
-function M.dump_range(mem, r, out_dir, prefix, cfg)
+function M.dump_range(mem, r, out_dir, cfg)
   local result = { written = 0, failed = false, partial = false, gaps = 0, files = {} }
 
   local split_bytes = (cfg.SPLIT_MB or 256) * 1024 * 1024
@@ -206,7 +211,7 @@ function M.dump_range(mem, r, out_dir, prefix, cfg)
   local parts = M.split_parts(r.size, split_bytes)
 
   for i, part in ipairs(parts) do
-    local name = M.range_filename(prefix, r, i - 1, #parts)
+    local name = M.range_filename(r, i - 1, #parts)
     local out = io.open(out_dir .. "/" .. name, "wb")
     if not out then
       result.failed = true
@@ -274,13 +279,12 @@ function M.get_pid()
 end
 
 -- The commands the operator runs on the host once the dump finishes.
--- adb pull cannot glob, so the files are tarred on the device and streamed.
--- The stream uses `adb exec-out`, not `adb shell`: adb shell runs the command
--- under a PTY and translates LF to CRLF, which silently corrupts binary data.
-function M.host_commands(out_dir, prefix)
+-- Every run lands in its own directory, so a plain recursive pull works:
+-- no glob, no tar stream, no exec-out.
+function M.host_commands(out_dir)
   return string.format(
-    "  mkdir -p ./dump\n  adb exec-out \"cd %s && tar cf - %s*\" | tar xf - -C ./dump\n  adb shell \"rm -f %s/%s*\"",
-    out_dir, prefix, out_dir, prefix)
+    "  adb pull %s ./dump\n  adb shell rm -rf %s",
+    out_dir, out_dir)
 end
 
 -- Apply the filter to a parsed maps list.
@@ -296,8 +300,8 @@ function M.select_ranges(all, cfg)
 end
 
 -- Write the maps snapshot for this run into the output directory.
-function M.write_maps_copy(out_dir, prefix, maps_text)
-  local f = io.open(out_dir .. "/" .. prefix .. "maps.txt", "w")
+function M.write_maps_copy(out_dir, maps_text)
+  local f = io.open(out_dir .. "/maps.txt", "w")
   if not f then return false end
   f:write(maps_text)
   f:close()
@@ -305,10 +309,10 @@ function M.write_maps_copy(out_dir, prefix, maps_text)
 end
 
 -- Dump every selected range and accumulate run-level stats.
-function M.dump_all(mem, selected, out_dir, prefix, cfg)
+function M.dump_all(mem, selected, out_dir, cfg)
   local stats = { written = 0, failed = 0, partial = 0, gaps = 0, done = 0 }
   for _, r in ipairs(selected) do
-    local res = M.dump_range(mem, r, out_dir, prefix, cfg)
+    local res = M.dump_range(mem, r, out_dir, cfg)
     stats.written = stats.written + res.written
     stats.gaps = stats.gaps + res.gaps
     if res.failed then stats.failed = stats.failed + 1 end
@@ -362,7 +366,7 @@ function M.main()
     return
   end
 
-  local out_dir = cfg.OUT_DIR
+  local out_dir = M.resolve_out_dir(cfg)
   local ok_dir, dir_msg = M.check_out_dir(out_dir)
   if not ok_dir then
     print(RED .. "[-] " .. dir_msg .. RESET)
@@ -370,10 +374,8 @@ function M.main()
   end
   print("[*] " .. dir_msg)
 
-  local prefix = M.run_prefix(pid, os.time())
-
-  if not M.write_maps_copy(out_dir, prefix, maps_text) then
-    print(RED .. "[-] cannot write " .. prefix .. "maps.txt in " .. out_dir .. RESET)
+  if not M.write_maps_copy(out_dir, maps_text) then
+    print(RED .. "[-] cannot write maps.txt in " .. out_dir .. RESET)
     return
   end
 
@@ -385,7 +387,7 @@ function M.main()
 
   print("[*] output: " .. out_dir)
 
-  local stats = M.dump_all(mem, selected, out_dir, prefix, cfg)
+  local stats = M.dump_all(mem, selected, out_dir, cfg)
   mem:close()
 
   print(string.format("%s[+] %d/%d ranges, %s written, %s zero-filled, %d failed, %d partial%s",
@@ -393,7 +395,7 @@ function M.main()
     stats.failed, stats.partial, RESET))
   print("")
   print(CYAN .. "[*] Run on host:" .. RESET)
-  print(M.host_commands(out_dir, prefix))
+  print(M.host_commands(out_dir))
 end
 
 if not _G.RENEFDUMP_TEST then

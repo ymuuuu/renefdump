@@ -4,40 +4,83 @@ Memory dumper for [renef](https://github.com/Ahmeth4n/renef), the Android ARM64
 instrumentation toolkit. A port of [fridump3](https://github.com/rootbsd/fridump3) to
 renef's Lua agent, for targets that detect Frida but not renef.
 
-Single file, no dependencies: `scripts/examples/renefdump.lua`.
+The device-side dumper is a single file with no dependencies,
+`scripts/examples/renefdump.lua`; the PC-side wrapper `renefdump.sh` runs the whole job end
+to end.
 
-## Usage
+## Quick start (wrapper)
 
-Copy the script into a renef checkout (or run it from this repo's path), then:
+The normal way to use this is the wrapper, which spawns the app, runs the dump inside it,
+pulls the result, and cleans up:
 
 ```
-adb forward tcp:1907 tcp:1907
-adb root
-adb shell mkdir -p /data/local/tmp/renefdump && adb shell chmod 777 /data/local/tmp/renefdump
-./build/renef
-renef> attach <pid>
+./renefdump.sh com.example.app
+```
+
+That produces `dumps/com.example.app-20260818-143022/` locally:
+
+```
+dumps/com.example.app-20260818-143022/
+├── 7f8a2c0000-7f8a2e0000_rw-p_heap.data
+├── 7f9012a000-7f9012c000_rw-p_libart.so.data
+├── ...
+└── maps.txt
+```
+
+Other invocations:
+
+```
+./renefdump.sh -a <pid>               # attach to a running pid instead of spawning
+./renefdump.sh -o <dir> <package>     # local output parent (default: ./dumps)
+./renefdump.sh -r <path> <package>    # path to the renef client binary
+./renefdump.sh -k <package>           # keep the dump on the device (skip cleanup)
+```
+
+The wrapper resolves the renef client from `-r`, `$RENEF_BIN`, `./build/renef`,
+`../renef/build/renef`, or `renef` on PATH; verifies exactly one device is connected; feeds
+`exit` to the client so it does not sit in the REPL; and fails loudly if the run produces no
+files on the device.
+
+## Manual route (inside a renef REPL)
+
+If you are already attached inside a renef client, load the script directly:
+
+```
 renef> l scripts/examples/renefdump.lua
 ```
 
-The output directory must exist before the script runs — the script never executes a shell
-(see below), so it cannot create it itself. The dump is written on the device. The script
-prints the commands to pull it:
+Create the output directory first (the script never executes a shell):
 
 ```
-  mkdir -p ./dump
-  adb exec-out "cd /data/local/tmp/renefdump && tar cf - 12847-1755512400_*" | tar xf - -C ./dump
-  adb shell "rm -f /data/local/tmp/renefdump/12847-1755512400_*"
+adb root
+adb shell mkdir -p /data/local/tmp/renefdump && adb shell chmod 777 /data/local/tmp/renefdump
 ```
 
-`adb pull` cannot glob, so the run's files are tarred on the device and streamed to the host.
+The dump is written on the device, and the script prints the two commands to pull it:
+
+```
+  adb pull /data/local/tmp/renefdump ./dump
+  adb shell rm -rf /data/local/tmp/renefdump
+```
+
+## Where the code runs
+
+The `.lua` script is never copied to the device. The renef client on the PC reads it,
+hex-encodes it, and ships the source over a socket to the agent injected in the target app;
+the Lua then executes inside the app process on the phone. That is why its `io.open` calls
+resolve against the device filesystem and the dump lands on the device, even though the
+source never leaves the PC as a file.
 
 ## Configuration
 
-Edit the `M.config` table at the top of the script — renef's `l` command passes no arguments.
+Edit the `M.config` table at the top of `scripts/examples/renefdump.lua` — renef's `l`
+command passes no arguments. The wrapper overrides the output directory per run by setting
+the `RENEFDUMP_OUT_DIR` global before the script body runs; `OUT_DIR` is the default used by
+the manual route.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `OUT_DIR` | `/data/local/tmp/renefdump` | Output directory; must already exist (create it from the host) |
+| `OUT_DIR` | `/data/local/tmp/renefdump` | Output directory (manual route; the wrapper overrides it per run) |
 | `PERMS_FILTER` | `"rw"` | `"rw"` = writable ranges only (fridump default), `"r"` = every readable range |
 | `SKIP_FILE_BACKED` | `false` | `true` limits the dump to anon/heap/stack |
 | `MAX_TOTAL_MB` | `1024` | Abort if the selection is larger |
@@ -47,15 +90,11 @@ Edit the `M.config` table at the top of the script — renef's `l` command passe
 
 ## Output
 
-All runs share `OUT_DIR`; each run's files carry a `<pid>-<timestamp>_` prefix. One file per
-memory range, named `<prefix><start>-<end>_<perms>_<label>.data`, e.g.
-`12847-1755512400_7f8a2c0000-7f8a2e0000_rw-p_heap.data`, plus a `<prefix>maps.txt` copy of
-`/proc/self/maps`. A range above `SPLIT_MB` becomes `.part0`, `.part1`, … which `cat` back
-together in order.
-
-Every file is exactly `end - start` bytes. Unreadable chunks are zero-filled rather than
-dropped, so offsets in the dump always match addresses in the maps — a gap shows up as a run
-of zero bytes, not as missing data.
+One file per memory range, named `<start>-<end>_<perms>_<label>.data`, plus a `maps.txt`
+copy of `/proc/self/maps`. A range above `SPLIT_MB` becomes `.part0`, `.part1`, … which
+`cat` back together in order. Every file is exactly `end - start` bytes: unreadable chunks
+are zero-filled, so offsets in the dump always match addresses in the maps — a gap shows up
+as a run of zero bytes, not as missing data.
 
 Unlike fridump3, the filename identifies the mapping a hit came from, and there are no
 routine split boundaries cutting a string in half.
@@ -75,11 +114,11 @@ error instead. The agent runs inside the target, so `self` is the target.
 
 ## No shell, by design
 
-The script never calls `os.execute` or `io.popen`. Executing a shell from inside an app
+The Lua script never calls `os.execute` or `io.popen`. Executing a shell from inside an app
 process can be blocked by SELinux, and Lua has no `mkdir` binding to fall back on. Directory
 creation and cleanup are done from the host with `adb`; on the device the script only writes
-files and calls `os.remove` (a stdlib call, not a shell). If `OUT_DIR` is missing, the script
-aborts and prints the exact `adb root` / `mkdir` / `chmod` commands to fix it.
+files and calls `os.remove` (a stdlib call, not a shell). If the output directory is missing,
+the script aborts and prints the exact `adb root` / `mkdir` / `chmod` commands to fix it.
 
 ## Testing
 
@@ -88,6 +127,6 @@ lua tests/test_renefdump.lua
 ```
 
 Unit tests cover the maps parser, range filter, filename sanitization, split arithmetic,
-space guards, the missing-directory guard, and the dump loop (against a synthetic memory
-file, including zero-filled gaps). Device verification is manual — see
-`docs/manual-test.md`.
+the output-directory override, space guards, the missing-directory guard, and the dump loop
+(against a synthetic memory file, including zero-filled gaps). The wrapper is shell — check
+it with `sh -n renefdump.sh`. Device verification is manual — see `docs/manual-test.md`.
