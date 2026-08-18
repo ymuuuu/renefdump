@@ -12,13 +12,12 @@ local M = {}
 -- renef's `l` command passes no arguments, so tune the dump here.
 
 M.config = {
-  OUT_BASE         = "/data/local/tmp", -- parent dir for the dump directory
+  OUT_DIR          = "/data/local/tmp/renefdump", -- output directory; must already exist (created from the host)
   PERMS_FILTER     = "rw",              -- "rw" = writable only (fridump default), "r" = any readable
   SKIP_FILE_BACKED = false,             -- true = anon/heap/stack only, skips mapped .so/.dex/.apk
   MAX_TOTAL_MB     = 1024,              -- abort if the selection exceeds this
   SPLIT_MB         = 256,               -- split a single range above this into .partN files
   CHUNK_KB         = 1024,              -- read granularity, bounds peak Lua memory
-  FREE_MARGIN      = 1.2,               -- require free space >= total * this
   VERBOSE          = false,             -- per-range logging
 }
 
@@ -111,14 +110,20 @@ function M.sanitize_label(path)
 end
 
 -- Build the output filename for one range (or one part of a split range).
--- part_index is 0-based. No suffix is added when part_count == 1.
-function M.range_filename(r, part_index, part_count)
-  local name = string.format("%x-%x_%s_%s",
-    r.start_addr, r.end_addr, r.perms, M.sanitize_label(r.path))
+-- prefix is the run's "<pid>-<timestamp>_" marker; part_index is 0-based;
+-- no part suffix is added when part_count == 1.
+function M.range_filename(prefix, r, part_index, part_count)
+  local name = string.format("%s%x-%x_%s_%s",
+    prefix or "", r.start_addr, r.end_addr, r.perms, M.sanitize_label(r.path))
   if part_count and part_count > 1 then
     name = name .. string.format(".part%d", part_index)
   end
   return name .. ".data"
+end
+
+-- The filename prefix that separates one run's files from another's.
+function M.run_prefix(pid, timestamp)
+  return string.format("%d-%d_", pid, timestamp)
 end
 
 -- Split a range size into contiguous parts no larger than split_bytes.
@@ -153,46 +158,34 @@ function M.fmt_size(bytes)
   end
 end
 
--- Extract available kilobytes from `df -k <dir>` output.
--- Columns from the right are: Mounted-on, Use%, Available.
-function M.parse_df_avail(text)
-  if type(text) ~= "string" then return nil end
-
-  for line in text:gmatch("[^\n]+") do
-    if not line:find("1K%-blocks") and not line:find("Filesystem") then
-      local fields = {}
-      for field in line:gmatch("%S+") do fields[#fields + 1] = field end
-      if #fields >= 5 then
-        local avail = tonumber(fields[#fields - 2])
-        if avail then return avail end
-      end
-    end
-  end
-  return nil
-end
-
--- Pre-flight guard. avail_kb may be nil when df is unavailable.
-function M.check_space(total_bytes, avail_kb, cfg)
-  local cap = (cfg.MAX_TOTAL_MB or 1024) * 1024 * 1024
+-- Pre-flight guard against an over-large selection.
+function M.check_space(total_bytes, cfg)
+  local cap_mb = cfg.MAX_TOTAL_MB or 1024
+  local cap = cap_mb * 1024 * 1024
   if total_bytes > cap then
     return false, string.format(
       "selection is %s, above the MAX_TOTAL_MB cap of %d MB - raise MAX_TOTAL_MB or narrow the filter",
-      M.fmt_size(total_bytes), cfg.MAX_TOTAL_MB or 1024)
+      M.fmt_size(total_bytes), cap_mb)
   end
+  return true, string.format(
+    "selection is %s, within the MAX_TOTAL_MB cap of %d MB",
+    M.fmt_size(total_bytes), cap_mb)
+end
 
-  if not avail_kb then
-    return true, "free space unknown, skipping check"
-  end
-
-  local need = total_bytes * (cfg.FREE_MARGIN or 1.2)
-  local avail = avail_kb * 1024
-  if avail < need then
+-- Verify the output directory exists and is writable. The script never
+-- executes a shell, so directory creation is the operator's job from the
+-- host; on failure the message carries the exact commands to run.
+function M.check_out_dir(dir)
+  local probe = dir .. "/.renefdump-probe"
+  local f, err = io.open(probe, "w")
+  if not f then
     return false, string.format(
-      "not enough free space: need %s, free %s",
-      M.fmt_size(need), M.fmt_size(avail))
+      "cannot write to %s (%s). Run on the host:\n  adb root\n  adb shell mkdir -p %s && adb shell chmod 777 %s",
+      dir, tostring(err), dir, dir)
   end
-
-  return true, string.format("free %s, need %s", M.fmt_size(avail), M.fmt_size(need))
+  f:close()
+  os.remove(probe)
+  return true, "output directory is writable: " .. dir
 end
 
 -- Copy one range from `mem` (an open /proc/<pid>/mem style handle) to disk.
@@ -201,55 +194,61 @@ end
 -- leaves the file position undefined, and the target keeps running, so a
 -- mapping can disappear mid-dump. Never dereference the address directly -
 -- renef's Memory.read and File.write do, and a bad page kills the target.
-function M.dump_range(mem, r, out_dir, cfg)
-  local result = { written = 0, failed = false, partial = false, files = {} }
+--
+-- An unreadable chunk is zero-filled rather than dropped, so the output file
+-- is always exactly `end - start` bytes and file offsets keep matching
+-- address offsets. Zero-filled bytes are counted in `result.gaps`.
+function M.dump_range(mem, r, out_dir, prefix, cfg)
+  local result = { written = 0, failed = false, partial = false, gaps = 0, files = {} }
 
   local split_bytes = (cfg.SPLIT_MB or 256) * 1024 * 1024
   local chunk = (cfg.CHUNK_KB or 1024) * 1024
   local parts = M.split_parts(r.size, split_bytes)
 
   for i, part in ipairs(parts) do
-    local name = M.range_filename(r, i - 1, #parts)
-    local out, oerr = io.open(out_dir .. "/" .. name, "wb")
+    local name = M.range_filename(prefix, r, i - 1, #parts)
+    local out = io.open(out_dir .. "/" .. name, "wb")
     if not out then
       result.failed = true
-      return result
+      break
     end
 
     local part_written = 0
+    local part_gaps = 0
     local offset = 0
     while offset < part.len do
       local want = part.len - offset
       if want > chunk then want = chunk end
 
       local pos = r.start_addr + part.offset + offset
-      local sought = mem:seek("set", pos)
-      if not sought then
-        result.partial = true
-        break
+      local ok, data
+      if mem:seek("set", pos) then
+        ok, data = pcall(mem.read, mem, want)
       end
 
-      local ok, data = pcall(mem.read, mem, want)
       if not ok or not data or #data == 0 then
+        -- Unreadable chunk: zero-fill so the file offset still maps to the
+        -- address offset, then move on to the next chunk.
+        out:write(string.rep("\0", want))
+        part_gaps = part_gaps + want
+        offset = offset + want
         result.partial = true
-        break
-      end
-
-      out:write(data)
-      part_written = part_written + #data
-      offset = offset + #data
-
-      if #data < want then
-        result.partial = true
-        break
+      else
+        out:write(data)
+        part_written = part_written + #data
+        if #data < want then
+          out:write(string.rep("\0", want - #data))
+          part_gaps = part_gaps + (want - #data)
+          result.partial = true
+        end
+        offset = offset + want
       end
     end
 
     out:close()
     result.written = result.written + part_written
+    result.gaps = result.gaps + part_gaps
     result.files[#result.files + 1] = name
-
-    if result.partial then break end
   end
 
   return result
@@ -275,10 +274,55 @@ function M.get_pid()
 end
 
 -- The commands the operator runs on the host once the dump finishes.
-function M.host_commands(out_dir)
+-- adb pull cannot glob, so the files are tarred on the device and streamed.
+-- The stream uses `adb exec-out`, not `adb shell`: adb shell runs the command
+-- under a PTY and translates LF to CRLF, which silently corrupts binary data.
+function M.host_commands(out_dir, prefix)
   return string.format(
-    "  adb pull %s ./dump\n  adb shell rm -rf %s",
-    out_dir, out_dir)
+    "  mkdir -p ./dump\n  adb exec-out \"cd %s && tar cf - %s*\" | tar xf - -C ./dump\n  adb shell \"rm -f %s/%s*\"",
+    out_dir, prefix, out_dir, prefix)
+end
+
+-- Apply the filter to a parsed maps list.
+function M.select_ranges(all, cfg)
+  local selected, total = {}, 0
+  for _, r in ipairs(all) do
+    if M.should_dump(r, cfg) then
+      selected[#selected + 1] = r
+      total = total + r.size
+    end
+  end
+  return selected, total
+end
+
+-- Write the maps snapshot for this run into the output directory.
+function M.write_maps_copy(out_dir, prefix, maps_text)
+  local f = io.open(out_dir .. "/" .. prefix .. "maps.txt", "w")
+  if not f then return false end
+  f:write(maps_text)
+  f:close()
+  return true
+end
+
+-- Dump every selected range and accumulate run-level stats.
+function M.dump_all(mem, selected, out_dir, prefix, cfg)
+  local stats = { written = 0, failed = 0, partial = 0, gaps = 0, done = 0 }
+  for _, r in ipairs(selected) do
+    local res = M.dump_range(mem, r, out_dir, prefix, cfg)
+    stats.written = stats.written + res.written
+    stats.gaps = stats.gaps + res.gaps
+    if res.failed then stats.failed = stats.failed + 1 end
+    if res.partial then stats.partial = stats.partial + 1 end
+    stats.done = stats.done + 1
+
+    if cfg.VERBOSE then
+      print(string.format("    %x-%x %s %s %s",
+        r.start_addr, r.end_addr, r.perms, M.fmt_size(res.written), r.path))
+    elseif stats.done % 10 == 0 or stats.done == #selected then
+      print(string.format("    %d/%d ranges, %s", stats.done, #selected, M.fmt_size(stats.written)))
+    end
+  end
+  return stats
 end
 
 local function read_file(path)
@@ -287,14 +331,6 @@ local function read_file(path)
   local content = f:read("a")
   f:close()
   return content
-end
-
-local function free_kb(dir)
-  local p = io.popen("df -k '" .. dir .. "' 2>/dev/null")
-  if not p then return nil end
-  local out = p:read("a")
-  p:close()
-  return M.parse_df_avail(out)
 end
 
 function M.main()
@@ -312,37 +348,34 @@ function M.main()
   local all = M.parse_maps(maps_text)
   print(string.format("[*] parsed %s: %d ranges", M.MAPS_PATH, #all))
 
-  local selected, total = {}, 0
-  for _, r in ipairs(all) do
-    if M.should_dump(r, cfg) then
-      selected[#selected + 1] = r
-      total = total + r.size
-    end
-  end
-
+  local selected, total = M.select_ranges(all, cfg)
   if #selected == 0 then
     print(YELLOW .. "[-] no ranges matched the filter" .. RESET)
     return
   end
   print(string.format("[*] selected %d ranges, %s", #selected, M.fmt_size(total)))
 
-  local ok, msg = M.check_space(total, free_kb(cfg.OUT_BASE), cfg)
+  local ok, msg = M.check_space(total, cfg)
   print("[*] " .. msg)
   if not ok then
     print(RED .. "[-] aborting before writing anything" .. RESET)
     return
   end
 
-  local out_dir = string.format("%s/renefdump-%d-%d", cfg.OUT_BASE, pid, os.time())
-  os.execute("mkdir -p '" .. out_dir .. "'")
-
-  local probe = io.open(out_dir .. "/maps.txt", "w")
-  if not probe then
-    print(RED .. "[-] cannot write to " .. out_dir .. RESET)
+  local out_dir = cfg.OUT_DIR
+  local ok_dir, dir_msg = M.check_out_dir(out_dir)
+  if not ok_dir then
+    print(RED .. "[-] " .. dir_msg .. RESET)
     return
   end
-  probe:write(maps_text)
-  probe:close()
+  print("[*] " .. dir_msg)
+
+  local prefix = M.run_prefix(pid, os.time())
+
+  if not M.write_maps_copy(out_dir, prefix, maps_text) then
+    print(RED .. "[-] cannot write " .. prefix .. "maps.txt in " .. out_dir .. RESET)
+    return
+  end
 
   local mem, merr = io.open(M.MEM_PATH, "rb")
   if not mem then
@@ -352,28 +385,15 @@ function M.main()
 
   print("[*] output: " .. out_dir)
 
-  local written, failed, partial, done = 0, 0, 0, 0
-  for _, r in ipairs(selected) do
-    local res = M.dump_range(mem, r, out_dir, cfg)
-    written = written + res.written
-    if res.failed then failed = failed + 1 end
-    if res.partial then partial = partial + 1 end
-    done = done + 1
-
-    if cfg.VERBOSE then
-      print(string.format("    %x-%x %s %s %s",
-        r.start_addr, r.end_addr, r.perms, M.fmt_size(res.written), r.path))
-    elseif done % 10 == 0 or done == #selected then
-      print(string.format("    %d/%d ranges, %s", done, #selected, M.fmt_size(written)))
-    end
-  end
+  local stats = M.dump_all(mem, selected, out_dir, prefix, cfg)
   mem:close()
 
-  print(string.format("%s[+] %d/%d ranges, %s written, %d failed, %d partial%s",
-    GREEN, done, #selected, M.fmt_size(written), failed, partial, RESET))
+  print(string.format("%s[+] %d/%d ranges, %s written, %s zero-filled, %d failed, %d partial%s",
+    GREEN, stats.done, #selected, M.fmt_size(stats.written), M.fmt_size(stats.gaps),
+    stats.failed, stats.partial, RESET))
   print("")
   print(CYAN .. "[*] Run on host:" .. RESET)
-  print(M.host_commands(out_dir))
+  print(M.host_commands(out_dir, prefix))
 end
 
 if not _G.RENEFDUMP_TEST then
