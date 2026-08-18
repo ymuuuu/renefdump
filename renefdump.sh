@@ -270,11 +270,28 @@ if [ -n "$ATTACH_PID" ]; then
   check_foreground "$ATTACH_PID"
 fi
 
+# The app's own directories, in the order the Lua script probes them.
+APP_DIR_CANDIDATES="/data/data/$PKG/cache /data/user/0/$PKG/cache /data/data/$PKG/files /data/data/$PKG"
+
+# Clear leftovers from an earlier interrupted run. They carry our own
+# renefdump- prefix, and if left in place the start-check and the DONE poll
+# would match the stale run and pull it instead of this one.
+STALE=$(adb shell su -c "ls -d $APP_DIR_CANDIDATES 2>/dev/null" | tr -d '\r' | while read -r d; do
+  [ -n "$d" ] && adb shell su -c "ls '$d'/renefdump-* 2>/dev/null" | tr -d '\r'
+done | grep -c . || true)
+if [ "${STALE:-0}" -gt 0 ]; then
+  echo "[*] clearing $STALE leftover file(s) from a previous run"
+  for d in $APP_DIR_CANDIDATES; do
+    adb shell su -c "rm -f '$d'/renefdump-*" 2>/dev/null || true
+  done
+fi
+
 # 5. Run the client with its stdin on a FIFO this wrapper holds open. The
 #    client loads the script and returns to its REPL within seconds, while a
 #    real dump runs for minutes; if the client exits, the agent's socket
 #    closes and its print() output goes nowhere. Keeping the write end open
-#    (and sending 'exit' only once the DONE sentinel appears) keeps the client
+#    (and sending 'q', the client's quit command, only once the DONE sentinel
+#    appears) keeps the client
 #    alive for the whole dump. The client's relay loop still goes quiet after
 #    ~5 s of silence - that only affects what is echoed to the terminal, not
 #    whether the agent keeps executing.
@@ -312,7 +329,6 @@ CLIENT_PID=$!
 #    cannot query /proc/<pid>/cmdline before the run, so this glob is the
 #    only option. The literal `renefdump-` prefix is what keeps the app's own
 #    files out of the match.
-APP_DIR_CANDIDATES="/data/data/$PKG/cache /data/user/0/$PKG/cache /data/data/$PKG/files /data/data/$PKG"
 
 find_app_dir() {
   # $1 = filename glob inside the app dir, e.g. 'renefdump-*.data'
@@ -377,9 +393,22 @@ echo "[*] dump complete signal received"
 # The client has done its job; close its stdin and let it exit. If the
 # client died mid-dump (while the agent kept going and wrote DONE), the FIFO
 # has no reader and this write would SIGPIPE - that must not abort the pull.
-printf 'exit\n' >&9 2>/dev/null || true
+printf 'q\n' >&9 2>/dev/null || true
 exec 9>&-
-wait "$CLIENT_PID" || true
+
+# Never block the pull on the client shutting down cleanly: give it a few
+# seconds to notice `q`, then terminate it. A dump that finished must not be
+# lost because the client stayed at its prompt.
+CLIENT_WAIT=0
+while kill -0 "$CLIENT_PID" 2>/dev/null; do
+  sleep 1
+  CLIENT_WAIT=$((CLIENT_WAIT + 1))
+  if [ "$CLIENT_WAIT" -ge 5 ]; then
+    kill "$CLIENT_PID" 2>/dev/null || true
+    break
+  fi
+done
+wait "$CLIENT_PID" 2>/dev/null || true
 
 # `ls <dir>/<glob>` prints full paths, and adb shell terminates lines with
 # CRLF, so reduce to a bare basename before deriving the prefix from it.
