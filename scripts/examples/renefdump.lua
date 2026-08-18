@@ -18,15 +18,12 @@ M.config = {
   SKIP_FILE_BACKED = false,             -- true = anon/heap/stack only, skips mapped .so/.dex/.apk
   SKIP_EMPTY       = true,              -- true = skip ranges with Rss: 0 (untouched ART reservations)
   MAX_TOTAL_MB     = 4096,              -- abort if the selection exceeds this
-  SPLIT_MB         = 256,               -- split a single range above this into .partN files
-  CHUNK_KB         = 1024,              -- read granularity, bounds peak Lua memory
-  HEARTBEAT_MB     = 32,                -- emit a progress line every this many MB during a range
+  SPLIT_MB         = 64,                -- hard ceiling: renef's File.write rejects any call above 100 MB
   VERBOSE          = false,             -- per-range logging
 }
 
 M.MAPS_PATH  = "/proc/self/maps"
 M.SMAPS_PATH = "/proc/self/smaps"
-M.MEM_PATH   = "/proc/self/mem"
 M.CMDLINE_PATH = "/proc/self/cmdline"
 
 -- Where the dump may live, tried in order. %s is the package name read from
@@ -46,6 +43,11 @@ local GREEN  = _G.GREEN or "\27[32m"
 local RED    = _G.RED or "\27[31m"
 local YELLOW = _G.YELLOW or "\27[33m"
 local RESET  = _G.RESET or "\27[0m"
+
+-- File.write(path, addr, size) exists only inside the renef agent. Resolve it
+-- once at load time so host-side tests (no renef) can substitute a fake that
+-- records its arguments and writes real bytes from a synthetic source.
+M.File = _G.File
 -- =========================================================
 
 -- Parse one /proc/self/maps line into a range record.
@@ -123,7 +125,7 @@ end
 -- Ranges that are never safe or never useful to dump, whatever the config.
 local function always_skip(path)
   if path:sub(1, 5) == "/dev/" then return true end  -- device memory: read can block
-  if path:sub(1, 6) == "[vvar]" then return true end  -- kernel page, unreadable via /proc/*/mem
+  if path:sub(1, 6) == "[vvar]" then return true end  -- kernel data page, not worth dumping
   if path:sub(1, 6) == "[vvar_" then return true end  -- [vvar_vclock] and friends
   return false
 end
@@ -208,6 +210,13 @@ function M.split_parts(size, split_bytes)
   return parts
 end
 
+-- renef's File.write rejects any call above 100 MB, so SPLIT_MB is a hard
+-- ceiling: clamp a higher configured value down to 64 MB rather than letting
+-- a bad config abort every large range.
+function M.clamp_split_mb(mb)
+  return math.min(mb or 64, 64)
+end
+
 -- Human-readable byte count.
 function M.fmt_size(bytes)
   bytes = bytes or 0
@@ -236,86 +245,31 @@ function M.check_space(total_bytes, cfg)
     M.fmt_size(total_bytes), cap_mb)
 end
 
--- Heartbeat output hook; tests replace it with a collector. Used only for
--- the mid-range progress lines so the renef client keeps relaying output.
-function M.log(msg)
-  print(msg)
-end
+-- Dump one range with renef's File.write(path, addr, size): it fopen(path,"wb")
+-- and fwrite(size) straight from the address, entirely in C, with a hard 100 MB
+-- per-call cap and no append mode - so a range is one call per part file, and a
+-- part above the cap is impossible because SPLIT_MB clamps to 64. The address
+-- is dereferenced directly with no fault guard. That is accepted: the residency
+-- filter only selects ranges smaps reports as readable (Rss > 0), and if the app
+-- unmaps a range mid-dump the target dies, the DONE sentinel is never written,
+-- and the wrapper reports the dump as incomplete rather than pulling a partial.
+function M.dump_range(r, out_dir, prefix, cfg)
+  local result = { written = 0, failed = false, files = {} }
 
--- Copy one range from `mem` (an open /proc/<pid>/mem style handle) to disk.
---
--- The handle is re-seeked before every chunk: a failed read on /proc/*/mem
--- leaves the file position undefined, and the target keeps running, so a
--- mapping can disappear mid-dump. Never dereference the address directly -
--- renef's Memory.read and File.write do, and a bad page kills the target.
---
--- An unreadable chunk is zero-filled rather than dropped, so the output file
--- is always exactly `end - start` bytes and file offsets keep matching
--- address offsets. Zero-filled bytes are counted in `result.gaps`.
-function M.dump_range(mem, r, out_dir, prefix, cfg)
-  local result = { written = 0, failed = false, partial = false, gaps = 0, files = {} }
-
-  local split_bytes = (cfg.SPLIT_MB or 256) * 1024 * 1024
-  local chunk = (cfg.CHUNK_KB or 1024) * 1024
-  local heartbeat = (cfg.HEARTBEAT_MB or 32) * 1024 * 1024
+  local split_bytes = M.clamp_split_mb(cfg.SPLIT_MB) * 1024 * 1024
   local parts = M.split_parts(r.size, split_bytes)
-
-  local processed, next_beat = 0, heartbeat
 
   for i, part in ipairs(parts) do
     local name = M.range_filename(prefix, r, i - 1, #parts)
-    local out = io.open(out_dir .. "/" .. name, "wb")
-    if not out then
+    local ok, msg = M.File.write(out_dir .. "/" .. name, r.start_addr + part.offset, part.len)
+    if not ok then
       result.failed = true
+      if cfg.VERBOSE then
+        print(string.format("    %s failed: %s", name, tostring(msg or "unknown error")))
+      end
       break
     end
-
-    local part_written = 0
-    local part_gaps = 0
-    local offset = 0
-    while offset < part.len do
-      local want = part.len - offset
-      if want > chunk then want = chunk end
-
-      local pos = r.start_addr + part.offset + offset
-      local ok, data
-      if mem:seek("set", pos) then
-        ok, data = pcall(mem.read, mem, want)
-      end
-
-      if not ok or not data or #data == 0 then
-        -- Unreadable chunk: zero-fill so the file offset still maps to the
-        -- address offset, then move on to the next chunk.
-        out:write(string.rep("\0", want))
-        part_gaps = part_gaps + want
-        offset = offset + want
-        result.partial = true
-      else
-        out:write(data)
-        part_written = part_written + #data
-        if #data < want then
-          out:write(string.rep("\0", want - #data))
-          part_gaps = part_gaps + (want - #data)
-          result.partial = true
-        end
-        offset = offset + want
-      end
-
-      -- The renef client stops relaying output after ~5 s of silence, so
-      -- report progress at least every HEARTBEAT_MB. Ranges smaller than
-      -- HEARTBEAT_MB finish before the first beat and print nothing.
-      processed = processed + want
-      if processed >= next_beat then
-        M.log(string.format("[*] %x-%x %s ... %s / %s",
-          r.start_addr, r.end_addr, r.perms,
-          M.fmt_size(processed), M.fmt_size(r.size)))
-        next_beat = processed + heartbeat
-      end
-    end
-
-    out:close()
-    result.written = result.written + part_written
-    result.gaps = result.gaps + part_gaps
+    result.written = result.written + part.len
     result.files[#result.files + 1] = name
   end
 
@@ -383,10 +337,10 @@ function M.count_skipped_empty(all, cfg)
   return n, bytes
 end
 
--- The completion sentinel payload: "ranges_done bytes_written bytes_gaps".
+-- The completion sentinel payload: "ranges_done bytes_written ranges_failed".
 -- The wrapper polls for a DONE file carrying this line before pulling.
 function M.done_line(stats)
-  return string.format("%d %d %d", stats.done, stats.written, stats.gaps)
+  return string.format("%d %d %d", stats.done, stats.written, stats.failed)
 end
 
 -- Write the maps snapshot for this run into the output directory.
@@ -399,14 +353,12 @@ function M.write_maps_copy(out_dir, prefix, maps_text)
 end
 
 -- Dump every selected range and accumulate run-level stats.
-function M.dump_all(mem, selected, out_dir, prefix, cfg)
-  local stats = { written = 0, failed = 0, partial = 0, gaps = 0, done = 0 }
+function M.dump_all(selected, out_dir, prefix, cfg)
+  local stats = { written = 0, failed = 0, done = 0 }
   for _, r in ipairs(selected) do
-    local res = M.dump_range(mem, r, out_dir, prefix, cfg)
+    local res = M.dump_range(r, out_dir, prefix, cfg)
     stats.written = stats.written + res.written
-    stats.gaps = stats.gaps + res.gaps
     if res.failed then stats.failed = stats.failed + 1 end
-    if res.partial then stats.partial = stats.partial + 1 end
     stats.done = stats.done + 1
 
     if cfg.VERBOSE then
@@ -526,18 +478,10 @@ function M.main()
     return
   end
 
-  local mem, merr = io.open(M.MEM_PATH, "rb")
-  if not mem then
-    print(RED .. "[-] cannot open " .. M.MEM_PATH .. ": " .. tostring(merr) .. RESET)
-    return
-  end
+  local stats = M.dump_all(selected, out_dir, prefix, cfg)
 
-  local stats = M.dump_all(mem, selected, out_dir, prefix, cfg)
-  mem:close()
-
-  print(string.format("%s[+] %d/%d ranges, %s written, %s zero-filled, %d failed, %d partial%s",
-    GREEN, stats.done, #selected, M.fmt_size(stats.written), M.fmt_size(stats.gaps),
-    stats.failed, stats.partial, RESET))
+  print(string.format("%s[+] %d/%d ranges, %s written, %d failed%s",
+    GREEN, stats.done, #selected, M.fmt_size(stats.written), stats.failed, RESET))
   print("")
   print(CYAN .. "[*] Run on host:" .. RESET)
   print(M.host_commands(out_dir, prefix))

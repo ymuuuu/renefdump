@@ -26,6 +26,8 @@ local function eq(name, got, want)
   check(name, got == want, "got " .. tostring(got) .. ", want " .. tostring(want))
 end
 
+check("File resolved from _G at load", M.File == _G.File)
+
 -- parse_maps_line ---------------------------------------------------------
 
 local r = M.parse_maps_line("7f8a2c0000-7f8a2e0000 rw-p 00000000 00:00 0                          [heap]")
@@ -237,32 +239,62 @@ local ok3, msg3 = M.check_space(2000 * 1024 * 1024, scfg)
 check("cap rejected", not ok3)
 check("cap message mentions MAX_TOTAL_MB", msg3 and msg3:find("MAX_TOTAL_MB"), msg3)
 
--- dump_range --------------------------------------------------------------
+-- clamp_split_mb -----------------------------------------------------------
+
+eq("clamp default", M.clamp_split_mb(nil), 64)
+eq("clamp below ceiling", M.clamp_split_mb(32), 32)
+eq("clamp at ceiling", M.clamp_split_mb(64), 64)
+eq("clamp above ceiling", M.clamp_split_mb(256), 64)
+
+-- dump_range (File.write) --------------------------------------------------
 
 local tmp = os.getenv("TMPDIR") or "/tmp"
 local test_dir = tmp .. "/renefdump-test-" .. tostring(os.time())
 os.execute("mkdir -p '" .. test_dir .. "'")
-
--- Build a 3 MB synthetic "memory" file with a recognizable pattern.
-local mem_path = test_dir .. "/fakemem"
-local mf = assert(io.open(mem_path, "wb"))
-local block = string.rep("ABCD", 256)          -- 1 KB
-for _ = 1, 3 * 1024 do mf:write(block) end     -- 3 MB
-mf:close()
-
-local dcfg = { SPLIT_MB = 1, CHUNK_KB = 64 }
 local out_dir = test_dir .. "/out"
 os.execute("mkdir -p '" .. out_dir .. "'")
 
-local mem = assert(io.open(mem_path, "rb"))
+-- A 3 MB synthetic memory image and a fake File that records its arguments
+-- and writes real bytes from the image, standing in for renef's File.write on
+-- a host that has no renef.
+local image = string.rep(string.rep("ABCD", 256), 3072)  -- 3 MB known pattern
 
--- A 2 KB range starting at offset 4096.
+local function make_fake_file(img, base)
+  local fake = { calls = {} }
+  fake.write = function(path, addr, size)
+    fake.calls[#fake.calls + 1] = { path = path, addr = addr, size = size }
+    local rel = addr - base
+    if rel < 0 or rel + size > #img then
+      return false, "read out of range"
+    end
+    local f = io.open(path, "wb")
+    if not f then return false, "failed to open file for writing" end
+    f:write(img:sub(rel + 1, rel + size))
+    f:close()
+    return true
+  end
+  return fake
+end
+
+local fake = make_fake_file(image, 0)
+M.File = fake
+
+local dcfg = { SPLIT_MB = 1, VERBOSE = false }
+
+-- A 2 KB range starting at offset 4096: one part, one file, exact name, and
+-- File.write called once at the absolute address.
 local small = { start_addr = 4096, end_addr = 4096 + 2048, size = 2048,
                 perms = "rw-p", path = "[heap]" }
-local res = M.dump_range(mem, small, out_dir, TP, dcfg)
+fake.calls = {}
+local res = M.dump_range(small, out_dir, TP, dcfg)
 eq("small range written", res.written, 2048)
 check("small range not failed", not res.failed)
 eq("small range one file", #res.files, 1)
+eq("small file name", res.files[1],
+   "renefdump-123-20260818-133552_1000-1800_rw-p_heap.data")
+eq("small write address", fake.calls[1].addr, 4096)
+eq("small write size", fake.calls[1].size, 2048)
+eq("small write path", fake.calls[1].path, out_dir .. "/" .. res.files[1])
 
 local f = assert(io.open(out_dir .. "/" .. res.files[1], "rb"))
 local content = f:read("a")
@@ -270,14 +302,21 @@ f:close()
 eq("small dump size on disk", #content, 2048)
 eq("small dump content", content:sub(1, 4), "ABCD")
 
--- A 2.5 MB range that must split into three 1 MB parts.
+-- A 2.5 MB range above the 1 MB split ceiling: three parts, addresses equal to
+-- r.start_addr + part.offset.
 local big = { start_addr = 0, end_addr = 2621440, size = 2621440,
               perms = "rw-p", path = "" }
-local bres = M.dump_range(mem, big, out_dir, TP, dcfg)
+fake.calls = {}
+local bres = M.dump_range(big, out_dir, TP, dcfg)
 eq("big range written", bres.written, 2621440)
 eq("big range parts", #bres.files, 3)
 check("big part0 named", bres.files[1]:find("part0", 1, true) ~= nil, bres.files[1])
 check("big part2 named", bres.files[3]:find("part2", 1, true) ~= nil, bres.files[3])
+
+eq("part0 address is start", fake.calls[1].addr, 0)
+eq("part1 address is start+1MB", fake.calls[2].addr, 1024 * 1024)
+eq("part2 address is start+2MB", fake.calls[3].addr, 2 * 1024 * 1024)
+eq("part2 size is remainder", fake.calls[3].size, 2621440 - 2 * 1024 * 1024)
 
 local total_on_disk = 0
 for _, name in ipairs(bres.files) do
@@ -287,78 +326,54 @@ for _, name in ipairs(bres.files) do
 end
 eq("big parts sum on disk", total_on_disk, 2621440)
 
--- A range past the end of the file: unreadable chunks are zero-filled and
--- the range is not abandoned.
-local past = { start_addr = 3 * 1024 * 1024, end_addr = 3 * 1024 * 1024 + 4096,
-               size = 4096, perms = "rw-p", path = "[stack]" }
-local pres = M.dump_range(mem, past, out_dir, TP, dcfg)
-check("past-end marked partial", pres.partial)
-check("past-end did not error", pres.failed == false)
-check("past-end has gaps", pres.gaps > 0)
-eq("past-end written zero", pres.written, 0)
-local pf = assert(io.open(out_dir .. "/" .. pres.files[1], "rb"))
-local pcontent = pf:read("a")
-pf:close()
-eq("past-end file full size", #pcontent, 4096)
-check("past-end file all zero", pcontent == string.rep("\0", 4096))
+-- A false return from File.write marks the range failed and stops it: the
+-- part that succeeded stays, the rest of the range is not attempted.
+local flaky = make_fake_file(image, 0)
+local orig_write = flaky.write
+flaky.write = function(path, addr, size)
+  if addr == 1024 * 1024 then
+    return false, "simulated fault"
+  end
+  return orig_write(path, addr, size)
+end
+M.File = flaky
+local fres = M.dump_range(big, out_dir, TP, dcfg)
+check("failure marks range failed", fres.failed)
+eq("failure stops the range", #fres.files, 1)
+eq("failure written is first part", fres.written, 1024 * 1024)
 
--- A range straddling the end of the file: data before the gap is kept, the
--- rest is zero-filled, and the chunk loop keeps running.
-local straddle = { start_addr = 3 * 1024 * 1024 - 2048,
-                   end_addr = 3 * 1024 * 1024 - 2048 + 8192,
-                   size = 8192, perms = "rw-p", path = "[anon:straddle]" }
-local sres = M.dump_range(mem, straddle, out_dir, TP, dcfg)
-check("straddle marked partial", sres.partial)
-eq("straddle written", sres.written, 2048)
-eq("straddle gaps", sres.gaps, 6144)
-eq("straddle one file", #sres.files, 1)
-local sf = assert(io.open(out_dir .. "/" .. sres.files[1], "rb"))
-local scontent = sf:read("a")
-sf:close()
-eq("straddle file full size", #scontent, 8192)
-eq("straddle keeps data", scontent:sub(1, 4), "ABCD")
-eq("straddle zero tail", scontent:sub(2049, 2052), "\0\0\0\0")
+-- With VERBOSE the failure message is printed.
+local err_lines = {}
+local saved_print = print
+print = function(s) err_lines[#err_lines + 1] = tostring(s) end
+M.dump_range(big, out_dir, TP, { SPLIT_MB = 1, VERBOSE = true })
+print = saved_print
+local joined = table.concat(err_lines, "\n")
+check("verbose failure message printed", joined:find("simulated fault", 1, true) ~= nil, joined)
 
--- Output-open failure: failed, nothing written, no files listed.
-local bad = M.dump_range(mem, small, test_dir .. "/no-such-out", TP, dcfg)
-check("open failure marks failed", bad.failed)
-eq("open failure written zero", bad.written, 0)
-eq("open failure no files", #bad.files, 0)
-
--- Heartbeat: mid-range progress lines keep the renef client relaying output.
-local beat_lines = {}
-local saved_log = M.log
-M.log = function(msg) beat_lines[#beat_lines + 1] = msg end
-
-local hb_cfg = { SPLIT_MB = 1, CHUNK_KB = 64, HEARTBEAT_MB = 1 }
-local hb_range = { start_addr = 0, end_addr = 3 * 1024 * 1024, size = 3 * 1024 * 1024,
-                   perms = "rw-p", path = "[anon:heartbeat]" }
-
--- A 2 KB range finishes before the first 1 MB beat: no heartbeat lines.
-M.dump_range(mem, small, out_dir, TP, hb_cfg)
-eq("no heartbeat for small range", #beat_lines, 0)
-
--- A 3 MB range with a 1 MB heartbeat fires exactly three lines.
-M.dump_range(mem, hb_range, out_dir, TP, hb_cfg)
-M.log = saved_log
-
-eq("heartbeat count", #beat_lines, 3)
-eq("heartbeat first line", beat_lines[1], "[*] 0-300000 rw-p ... 1.0 MB / 3.0 MB")
-eq("heartbeat last line", beat_lines[3], "[*] 0-300000 rw-p ... 3.0 MB / 3.0 MB")
+-- An out-of-image read (the app unmapped the range mid-dump) is also a
+-- failure: failed, nothing written for that range.
+local short = make_fake_file(string.rep("A", 4096), 0)
+M.File = short
+local oob = { start_addr = 0, end_addr = 8192, size = 8192,
+              perms = "rw-p", path = "[heap]" }
+local ores = M.dump_range(oob, out_dir, TP, dcfg)
+check("out-of-range read marks failed", ores.failed)
+eq("out-of-range written zero", ores.written, 0)
+eq("out-of-range no files", #ores.files, 0)
 
 -- dump_all ----------------------------------------------------------------
 
-local dstats = M.dump_all(mem, { small, past }, out_dir, TP, dcfg)
+M.File = fake
+local dstats = M.dump_all({ small, big }, out_dir, TP, dcfg)
 eq("dump_all done", dstats.done, 2)
-eq("dump_all written", dstats.written, 2048)
-eq("dump_all gaps", dstats.gaps, 4096)
+eq("dump_all written", dstats.written, 2048 + 2621440)
 eq("dump_all failed", dstats.failed, 0)
-eq("dump_all partial", dstats.partial, 1)
 
 -- done_line ---------------------------------------------------------------
 
-eq("done line", M.done_line({ done = 47, written = 205000000, gaps = 1024 }),
-   "47 205000000 1024")
+eq("done line", M.done_line({ done = 47, written = 205000000, failed = 3 }),
+   "47 205000000 3")
 
 -- write_maps_copy ----------------------------------------------------------
 
@@ -374,7 +389,6 @@ end
 check("write_maps_copy fails on missing dir",
       not M.write_maps_copy(wmc_dir .. "/nope", TP, "x"))
 
-mem:close()
 os.execute("rm -rf '" .. test_dir .. "'")
 
 -- count_skipped_empty ------------------------------------------------------
@@ -418,6 +432,11 @@ check("config table exists", type(M.config) == "table")
 check("OUT_DIR removed from config", M.config.OUT_DIR == nil)
 check("resolve_out_dir removed", M.resolve_out_dir == nil)
 check("check_out_dir removed", M.check_out_dir == nil)
+eq("SPLIT_MB default", M.config.SPLIT_MB, 64)
+check("CHUNK_KB removed from config", M.config.CHUNK_KB == nil)
+check("HEARTBEAT_MB removed from config", M.config.HEARTBEAT_MB == nil)
+check("MEM_PATH removed", M.MEM_PATH == nil)
+check("clamp_split_mb exposed", type(M.clamp_split_mb) == "function")
 
 -- read_package and app_dir -------------------------------------------------
 

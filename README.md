@@ -10,14 +10,19 @@ to end.
 
 ## Quick start (wrapper)
 
-The normal way to use this is the wrapper, which spawns the app, runs the dump inside it,
-pulls the result, and cleans up. The dump lands in the app's own private directory on the
-device and is retrieved through `adb shell su`, so the device must be rooted (KernelSU
-works; `adb root` is not required):
+The normal way to use this is the wrapper, which attaches to the running app, runs the
+dump inside it, pulls the result, and cleans up. The dump lands in the app's own private
+directory on the device and is retrieved through `adb shell su`, so the device must be
+rooted (KernelSU works; `adb root` is not required):
 
 ```
 ./renefdump.sh com.example.app
 ```
+
+> **The app must be running, used, and left in the foreground.** Launch it, log in, open
+> the screen you care about, and keep it on screen — then run the dump. A freshly started
+> app has an empty heap, and Android freezes backgrounded apps (`cpuset:/background`), which
+> cannot run the injected agent at all.
 
 That produces `dumps/renefdump-<pid>-<timestamp>/` locally:
 
@@ -35,7 +40,8 @@ files out of the app's cache directory, which also holds the app's own files.
 Other invocations:
 
 ```
-./renefdump.sh -a <pid>               # attach to a running pid instead of spawning
+./renefdump.sh -a <pid>               # attach by pid instead of by package name
+./renefdump.sh -s <package>           # spawn first (rarely useful: empty heap)
 ./renefdump.sh -o <dir> <package>     # local output parent (default: ./dumps)
 ./renefdump.sh -r <path> <package>    # path to the renef client binary
 ./renefdump.sh -k <package>           # keep the dump on the device (skip cleanup)
@@ -44,8 +50,10 @@ Other invocations:
 The wrapper resolves the renef client from `-r`, `$RENEF_BIN`, `./build/renef`,
 `../renef/build/renef`, or `renef` on PATH; verifies exactly one device is connected;
 verifies `adb shell su -c id` reports uid=0 (root is needed to read the dump back out of
-the app's private directory); feeds `exit` to the client so it does not sit in the REPL;
-and fails loudly if the run produces no files on the device.
+the app's private directory); holds the client's stdin open on a FIFO until the dump
+signals completion, then tells it to exit (a real dump outlives the script load, and if
+the client exits early the agent's `print()` output goes nowhere); and fails loudly if
+the run produces no files on the device.
 
 ## Manual route (inside a renef REPL)
 
@@ -84,9 +92,7 @@ command passes no arguments.
 | `SKIP_FILE_BACKED` | `false` | `true` limits the dump to anon/heap/stack |
 | `SKIP_EMPTY` | `true` | Skip ranges with `Rss: 0` — never-touched reservations that can only read as zeros |
 | `MAX_TOTAL_MB` | `4096` | Abort if the selection is larger |
-| `SPLIT_MB` | `256` | Split a single range above this into `.partN` files |
-| `CHUNK_KB` | `1024` | Read granularity |
-| `HEARTBEAT_MB` | `32` | Emit a progress line every this many MB while dumping a range |
+| `SPLIT_MB` | `64` | Split a single range above this into `.partN` files; **hard ceiling** — renef's `File.write` rejects any call above 100 MB, so a higher configured value is clamped to 64 |
 | `VERBOSE` | `false` | Log every range |
 
 ## Output
@@ -96,12 +102,10 @@ writable, else `/data/user/0/<pkg>/cache`, `/data/data/<pkg>/files`, then `/data
 One file per memory range, named `<prefix><start>-<end>_<perms>_<label>.data` where
 `<prefix>` is `renefdump-<pid>-<timestamp>_`, plus a `<prefix>maps.txt` copy of
 `/proc/self/maps`. A range above `SPLIT_MB` becomes `.part0`, `.part1`, … which `cat` back
-together in order. Every file is exactly `end - start` bytes: unreadable chunks are
-zero-filled, so offsets in the dump always match addresses in the maps — a gap shows up as a
-run of zero bytes, not as missing data.
+together in order.
 
 When the run completes, the script writes a `<prefix>DONE` file containing
-`<ranges> <bytes_written> <bytes_zero_filled>`; the wrapper waits for that sentinel before
+`<ranges> <bytes_written> <ranges_failed>`; the wrapper waits for that sentinel before
 pulling, because the client returning does not mean the dump finished.
 
 Unlike fridump3, the filename identifies the mapping a hit came from, and there are no
@@ -127,11 +131,17 @@ could do on the device:
 strings -n 8 dump/*.data | sort -u > strings.txt
 ```
 
-## Why /proc/self/mem
+## Why File.write, not /proc/self/mem
 
-renef's `Memory.read()` and `File.write()` dereference the address directly with no fault
-guard, so one unreadable page kills the target process. `/proc/self/mem` returns a read
-error instead. The agent runs inside the target, so `self` is the target.
+The agent cannot read its own memory through `/proc/self/mem`: opening it runs a
+`ptrace_may_access` check even for the process's own pid, and Android's SELinux policy
+denies an `untrusted_app` the `process:ptrace` permission that check requires — root can
+open it, the app cannot open its own. The dump therefore uses renef's
+`File.write(path, addr, size)`, which opens the file `"wb"` and `fwrite`s straight from the
+address, entirely in C. It dereferences the address directly with no fault guard; that is
+acceptable because the residency filter only selects ranges smaps reports as readable, and
+if the app unmaps a range mid-dump the target dies, the DONE sentinel is never written, and
+the wrapper reports the dump as incomplete rather than pulling a partial one.
 
 ## No shell, by design
 
@@ -160,7 +170,8 @@ lua tests/test_renefdump.lua
 ```
 
 Unit tests cover the maps parser, range filter, filename sanitization, split arithmetic,
-on-device output-directory selection, space guards, the skipped-non-resident count, and the
-dump loop (against a synthetic memory file, including zero-filled gaps). The wrapper is
-shell — check it with `sh -n renefdump.sh`. Device verification is manual — see
-`docs/manual-test.md`.
+on-device output-directory selection, space guards, the skipped-non-resident count, and
+the File.write dump loop (via a fake `File.write` that records its arguments and writes
+real bytes from a synthetic source, standing in for renef's C implementation on a host
+without renef). The wrapper is shell — check it with `sh -n renefdump.sh`. Device
+verification is manual — see `docs/manual-test.md`.
